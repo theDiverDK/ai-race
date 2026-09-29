@@ -41,6 +41,16 @@ HOW_MADE = {
     "child": "a bred child of two top cars (crossover + mutation)",
     "newcomer": "a brand-new random network",
 }
+# Selection fitness. Every brain also drives probe roads (other orientations of
+# the same road, plus a nearby road) in the same heat, and is judged on its
+# distance there too, so it cannot win by learning one road or one direction.
+FITNESS_MEAN_WEIGHT = 0.5  # the rest goes to the worst road, so weak spots hurt
+REFERENCE_SPEED = 0.5 * 220.0  # px/s used to scale distance to about 0..1
+ORIENTATIONS = [(False, False), (True, False), (False, True), (True, True)]
+ORIENTATION_NAMES = {
+    (False, False): "", (True, False): "mirrored",
+    (False, True): "reversed", (True, True): "mirrored + reversed",
+}
 SENSOR_NOISE = 0.02
 START_ANGLE_JITTER = 0.10
 SAVE_PATH = Path(__file__).with_name("best_network.json")
@@ -123,10 +133,12 @@ def pinched_width(width: int, theta: float, centers: tuple[float, ...], depth: f
 
 
 class Track:
-    def __init__(self, level: int = 1) -> None:
+    def __init__(self, level: int = 1, mirror: bool = False, reverse: bool = False) -> None:
         if not 1 <= level <= len(ROAD_SPECS):
             raise ValueError(f"Road number must be between 1 and {len(ROAD_SPECS)}")
         self.level = level
+        self.mirror = mirror
+        self.reverse = reverse
         self.name, self.road_width, waves, pinch_centers, pinch_depth = ROAD_SPECS[level - 1]
         if level == 1:
             controls = [
@@ -169,6 +181,13 @@ class Track:
                      400 + 215 * radius * math.sin(theta))
                 )
                 self.widths.append(pinched_width(self.road_width, theta, pinch_centers, pinch_depth))
+        # Mirroring swaps every left turn for a right turn; reversing drives the
+        # same road the other way round. Together they give four roads from one.
+        if mirror:
+            self.points = [(WORLD_W - x, y) for x, y in self.points]
+        if reverse:
+            self.points = self.points[::-1]
+            self.widths = self.widths[::-1]
         self.count = len(self.points)
         self.lengths = []
         self.cumulative = [0.0]
@@ -182,7 +201,18 @@ class Track:
         road_alpha = pygame.Surface((WORLD_W, HEIGHT), pygame.SRCALPHA)
         draw_road_band(road_alpha, self.points, self.widths, (255, 255, 255))
         self.mask = pygame.mask.from_surface(road_alpha)
-        self.art = self._make_art()
+        self._art: pygame.Surface | None = None
+        suffix = ORIENTATION_NAMES[(mirror, reverse)]
+        self.label = f"Road {level}" + (f" {suffix}" if suffix else "")
+        if suffix:
+            self.name = f"{self.name} ({suffix})"
+
+    @property
+    def art(self) -> pygame.Surface:
+        """Drawn on first use: probe roads are only driven, never shown."""
+        if self._art is None:
+            self._art = self._make_art()
+        return self._art
 
     def on_road(self, x: float, y: float) -> bool:
         ix, iy = int(x), int(y)
@@ -397,7 +427,8 @@ class Race:
         # Slots only mean something once a generation was bred from ranked parents.
         self.roles_known = bool(seed_networks)
         self.last_result: tuple[str, str] | None = None  # who won the previous generation
-        self._tracks = {track.level: track}
+        self._tracks = {(track.level, track.mirror, track.reverse): track}
+        self.probes: list[tuple[Track, list[Car]]] = []
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
             brains = next_generation(ranked, self.rng, POPULATION)
@@ -406,24 +437,54 @@ class Race:
             brains = [Network.random(self.sizes, self.rng) for _ in range(POPULATION)]
         self._spawn(brains)
 
-    def _spawn(self, brains: list[Network]) -> None:
-        x, y = self.track.points[0]
-        nx, ny = self.track.points[1]
+    def _make_cars(self, track: Track, brains: list[Network]) -> list[Car]:
+        x, y = track.points[0]
+        nx, ny = track.points[1]
         base_angle = math.atan2(ny - y, nx - x)
         px, py = -math.sin(base_angle), math.cos(base_angle)
-        start_spread = min(15, self.track.road_width * 0.18)
-        self.cars = [
+        start_spread = min(15, track.road_width * 0.18)
+        return [
             Car(brain, x + px * self.rng.uniform(-start_spread, start_spread),
                 y + py * self.rng.uniform(-start_spread, start_spread),
                 base_angle + self.rng.uniform(-START_ANGLE_JITTER, START_ANGLE_JITTER))
             for brain in brains
         ]
+
+    def _spawn(self, brains: list[Network]) -> None:
+        self.cars = self._make_cars(self.track, brains)
+        self.probes = [(track, self._make_cars(track, brains)) for track in self._choose_probes()]
         self.elapsed = 0.0
 
-    def track_for(self, level: int) -> Track:
-        if level not in self._tracks:
-            self._tracks[level] = Track(level)
-        return self._tracks[level]
+    def _choose_probes(self) -> list[Track]:
+        """Two roads besides the shown one: this road another way round, and a nearby road."""
+        current = (self.track.level, self.track.mirror, self.track.reverse)
+        level = self.track.level
+        same_road = self.rng.choice([o for o in ORIENTATIONS if o != current[1:]])
+        picks = [(level, *same_road)]
+        for _ in range(10):
+            other = (self.rng.randint(1, min(len(ROAD_SPECS), level + 1)), *self.rng.choice(ORIENTATIONS))
+            if other != current and other not in picks:
+                picks.append(other)
+                break
+        return [self.track_for(*pick) for pick in picks]
+
+    def track_for(self, level: int, mirror: bool = False, reverse: bool = False) -> Track:
+        key = (level, mirror, reverse)
+        if key not in self._tracks:
+            self._tracks[key] = Track(level, mirror, reverse)
+        return self._tracks[key]
+
+    def fitness(self, index: int) -> float:
+        """How well brain `index` drove the shown road and every probe road.
+
+        Distance is scaled to the same units on every road. The score blends the
+        average with the worst road, so a brain must cope with all of them.
+        """
+        reference = REFERENCE_SPEED * self.heat_limit
+        values = [self.cars[index].best_progress / reference]
+        values += [cars[index].best_progress / reference for _, cars in self.probes]
+        mean = sum(values) / len(values)
+        return FITNESS_MEAN_WEIGHT * mean + (1 - FITNESS_MEAN_WEIGHT) * min(values)
 
     @property
     def laps_required(self) -> int:
@@ -471,13 +532,6 @@ class Race:
             return car
         return self.leader or self.best_car
 
-    def _beats(self, challenger: Car, champion: Car) -> bool:
-        if challenger.fastest_lap is not None:
-            return champion.fastest_lap is None or challenger.fastest_lap < champion.fastest_lap * (1 - BEAT_MARGIN)
-        if champion.fastest_lap is not None:
-            return False
-        return challenger.best_progress > champion.best_progress * (1 + BEAT_MARGIN)
-
     def save_now(self) -> None:
         """Write the record-setting model and score if the record is not saved yet."""
         if not self.save_path or self.record_brain is None or self.best_score_ever <= self.saved_best_score:
@@ -491,7 +545,7 @@ class Race:
     def change_track(self, track: Track) -> None:
         """Jump to another road: the heat restarts and the gauntlet begins there."""
         self.track = track
-        self._tracks.setdefault(track.level, track)
+        self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
         self.fastest_ever = None
         self.history.clear()
@@ -503,6 +557,9 @@ class Race:
         self.elapsed += dt
         for car in self.cars:
             car.update(self.track, dt)
+        for track, cars in self.probes:
+            for car in cars:
+                car.update(track, dt)
         self.best_ever = max(self.best_ever, *(car.best_progress for car in self.cars))
         for car in self.cars:
             if car.fastest_lap is not None:
@@ -517,31 +574,36 @@ class Race:
             self.record_brain = self.scoring_car.brain
         goal = self.champion is not None and self.champion_laps >= self.laps_required
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
-        if goal or time_expired or not any(car.alive for car in self.cars):
+        anyone_alive = any(car.alive for car in self.cars) or any(
+            car.alive for _, cars in self.probes for car in cars
+        )
+        if goal or time_expired or not anyone_alive:
             self._end_heat(goal)
 
     def _end_heat(self, goal: bool) -> None:
-        ranked = [(car.rank_key, car.brain) for car in self.cars]
+        fitness = [self.fitness(index) for index in range(len(self.cars))]
+        ranked = [((value,), car.brain) for value, car in zip(fitness, self.cars)]
         self.history.append(max(car.best_progress for car in self.cars))
         self.history = self.history[-40:]
         brains = next_generation(ranked, self.rng, POPULATION)
         self.save_now()
         champion_car = self.champion_car
-        winner = max(self.cars, key=lambda car: car.rank_key)
+        winner_index = max(range(len(self.cars)), key=fitness.__getitem__)
         if self.roles_known:
-            winner_text = HOW_MADE[slot_role(self.cars.index(winner), POPULATION)]
+            winner_text = HOW_MADE[slot_role(winner_index, POPULATION)]
         else:
             winner_text = "a random starting network"
         headline = f"Generation {self.generation} was won by {winner_text}."
-        next_level = 1
+        next_track = self.track_for(1)
         if champion_car is None:
             self.champion = brains[0]
             self._reset_gauntlet()
             outcome = "It is the first champion; the run starts on road 1."
         else:
-            best = max(self.cars, key=lambda car: car.rank_key)
             crashed = not champion_car.alive and not goal
-            if crashed or (best is not champion_car and self._beats(best, champion_car)):
+            # A challenger must be clearly fitter over all roads to take the title.
+            beaten = fitness[winner_index] > fitness[0] * (1 + BEAT_MARGIN) and winner_index != 0
+            if crashed or beaten:
                 # Crash, or a clearly better car: new champion, back to road 1.
                 self.champion = brains[0]
                 self._reset_gauntlet()
@@ -553,7 +615,7 @@ class Race:
             else:
                 outcome = "The champion keeps its title."
                 brains[0] = self.champion  # the champion always survives unchanged
-                next_level = self.track.level
+                next_track = self.track  # laps are still owed on this road
                 self.run_banked += champion_car.lap_score(self.track)
                 if goal:
                     self.tracks_completed += 1
@@ -561,13 +623,15 @@ class Race:
                     outcome = f"The champion finished road {self.track.level} and has now completed {self.tracks_completed}."
                     if self.random_phase or self.track.level == len(ROAD_SPECS):
                         self.random_phase = True
-                        next_level = self.rng.randint(1, len(ROAD_SPECS))
+                        # After the last road, roads and orientations are random.
+                        next_track = self.track_for(
+                            self.rng.randint(1, len(ROAD_SPECS)), *self.rng.choice(ORIENTATIONS))
                     else:
-                        next_level = self.track.level + 1
+                        next_track = self.track_for(self.track.level + 1)
                 else:
                     self.laps_banked += champion_car.laps_completed
-        if next_level != self.track.level:
-            self.track = self.track_for(next_level)
+        if next_track is not self.track:
+            self.track = next_track
             self.best_ever = 0.0
             self.fastest_ever = None
             self.history.clear()
@@ -725,10 +789,12 @@ class App:
         self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), 38, 133, MUTED, self.small)
         self.label(f"Run score: {self.race.current_score:,.0f}", 37, 160, ORANGE, self.font)
         self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", 38, 186, MUTED, self.small)
-        if self.race.last_result:
-            pygame.draw.rect(self.screen, (11, 22, 30), (22, HEIGHT - 116, 640, 50), border_radius=8)
-            self.label(self.race.last_result[0], 36, HEIGHT - 110, TEXT, self.small)
-            self.label(self.race.last_result[1], 36, HEIGHT - 89, MUTED, self.small)
+        probes = ", ".join(track.label for track, _ in self.race.probes)
+        lines = [*(self.race.last_result or ()), f"Every car is also tested on: {probes}"]
+        top = HEIGHT - 66 - 21 * len(lines)
+        pygame.draw.rect(self.screen, (11, 22, 30), (22, top - 6, 640, 21 * len(lines) + 10), border_radius=8)
+        for row, line in enumerate(lines):
+            self.label(line, 36, top + 21 * row, TEXT if row == 0 and self.race.last_result else MUTED, self.small)
 
         pygame.draw.rect(self.screen, (11, 22, 30), (22, HEIGHT - 58, 580, 37), border_radius=8)
         self.label("P  pause     R  restart     V  sensors     TAB  speed     ARROWS  road", 36, HEIGHT - 49, MUTED, self.small)

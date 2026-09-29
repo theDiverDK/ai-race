@@ -31,15 +31,23 @@ python main.py
 
 ## How learning works
 
-Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. A car that completes a lap ranks above any car that has not; among finishers, the fastest lap wins. Until a car completes a lap, furthest forward progress determines the ranking. At the end of a heat, the two best networks pass to the next generation unchanged, two lightly mutated copies of them (small nudges, no crossover) follow, most of the rest are bred and mutated from high-ranking cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
+Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. Cars are ranked by fitness (see below). At the end of a heat, the two best networks pass to the next generation unchanged, two lightly mutated copies of them (small nudges, no crossover) follow, most of the rest are bred and mutated from high-ranking cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
 
 ### The gauntlet and the counter
 
 The best car (the *champion*) always sits in slot 0 of each generation, unchanged. Training always starts on Road 1. The champion must finish 5 laps on a road (laps carry over between heats) before the next road starts; Roads 1 to 11 run in order, and Road 11 needs 10 laps and gets a 60 second heat. After that, roads are random, and every road the champion completes keeps adding to the **Tracks completed** counter shown on the track and in the panel.
 
-The counter resets to 0 and training restarts on Road 1 whenever the champion crashes (leaves the road or stalls) or another car clearly beats it: it finishes a lap when the champion has not, or its fastest lap is at least 3% faster. The best car of that generation becomes the new champion. Jumping to another road with the road arrows also resets the counter and starts the gauntlet from that road.
+The counter resets to 0 and training restarts on Road 1 whenever the champion crashes (leaves the road or stalls) or another car is clearly fitter: at least 3% higher fitness (see below). The best car of that generation becomes the new champion. Jumping to another road with the road arrows also resets the counter and starts the gauntlet from that road.
 
-To avoid overfitting one road, sensor readings carry a little noise and cars start with a small random heading and offset.
+### Learning to drive, not to remember a road
+
+A network that only fits one road, or one direction of it, would look good in a single race and then fail elsewhere. Three things prevent that:
+
+- **Probe roads.** In every heat each network also drives two hidden probe roads at the same time, with its own random start: the shown road in a different orientation, and a nearby road (at most one ahead of the current one). Probe roads are simulated, not drawn; the note at the bottom left lists them.
+- **Mirrored and reversed roads.** Every road exists in four orientations: original, mirrored (left turns become right turns), reversed (driven the other way round) and both. A network that just leans one way cannot pass all four. After Road 11 the shown road is random in road and orientation too.
+- **Fitness across all roads.** Selection uses `0.5 × average + 0.5 × worst` of the distance driven on the shown road and both probe roads, scaled to the same units on every road. A specialist that is brilliant on one road and crashes on the others loses to an all-rounder. The champion's 5-lap gauntlet on 11 different roads is the final exam.
+
+Sensor readings also carry a little noise, and cars start with a small random heading and offset.
 
 ### Who won the last generation
 

@@ -29,7 +29,8 @@ Tests set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`, so they run headl
 ## Conventions and invariants
 
 - The output layer always has exactly 3 neurons. Drive is signed (negative means reverse, capped below forward speed). A positive brake output slows the car in either direction.
-- Ranking: a car that completes a lap beats any car that has not, and finishers are ordered by fastest lap. Otherwise furthest forward progress decides.
+- Selection uses `Race.fitness(i)`: every brain also drives two probe roads (`Race.probes`, art-less `Track` variants) in the same heat; fitness = 0.5 × mean + 0.5 × min of distance / `REFERENCE_SPEED × heat_limit`. `Car.rank_key` (laps, then distance) is only used to pick the leader shown on screen. Never rank on the shown road alone: that is how a network memorises a road.
+- `Track(level, mirror, reverse)` gives four orientations of each road; `Track.art` is drawn lazily, so only shown roads cost memory. Always look roads up through `Race.track_for(level, mirror, reverse)`.
 - There are 11 roads. Roads 1, 2, 10 and 11 keep their original layouts, and `test_race.py` asserts on geometry such as the start point and road widths. Update those tests deliberately when you change `ROAD_SPECS`.
 - Gauntlet (`Race`): the champion is always `cars[0]`. It needs `LAPS_PER_ROAD` (5) laps per road, `FINAL_ROAD_LAPS` (10) and a 60 s heat on road 11, then random roads; `tracks_completed` keeps counting. A champion crash or a challenger that beats it by `BEAT_MARGIN` resets to road 1 and 0. Always start on road 1.
 - `best_network.json` is written only when `best_score_ever` beats the saved score. Tests must never touch the real file: `test_race.py` patches `main.SAVE_PATH` to a temp directory in `setUp`.
