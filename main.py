@@ -21,7 +21,12 @@ POPULATION = 50
 DEFAULT_MAX_RUNTIME = 25
 DEFAULT_HIDDEN_WIDTH = 16
 SENSOR_RANGE = 175
-LAP_GENERATIONS_TO_ADVANCE = 5
+LAPS_PER_ROAD = 5
+FINAL_ROAD_LAPS = 10
+FINAL_ROAD_RUNTIME = 60
+# A challenger must be this much faster (or finish when the champion has not)
+# before it takes the title, so a near-identical clone cannot reset progress.
+BEAT_MARGIN = 0.03
 SENSOR_NOISE = 0.02
 START_ANGLE_JITTER = 0.10
 SAVE_PATH = Path(__file__).with_name("best_network.json")
@@ -322,11 +327,17 @@ class Car:
 
 
 class Race:
+    """Runs heats and tracks the champion through the gauntlet.
+
+    The champion (slot 0 of every generation) must finish 5 laps on each road
+    in turn, 10 on the final road, then faces random roads. A crash or a
+    clearly better challenger crowns a new champion and restarts at road 1.
+    """
+
     def __init__(
         self, track: Track, inputs: int, hidden: list[int],
         max_runtime: int = DEFAULT_MAX_RUNTIME, time_limit_enabled: bool = True,
-        mix_roads: bool = True, seed_networks: list[Network] | None = None,
-        unlocked: int | None = None, saved_unlocked: int = 0,
+        seed_networks: list[Network] | None = None, saved_tracks: int = 0,
         save_path: Path | None = None,
     ) -> None:
         self.track = track
@@ -337,21 +348,22 @@ class Race:
         self.time_limit_enabled = time_limit_enabled
         self.sizes = (inputs, *hidden, 3)
         self.generation = 1
-        self.lap_streak = 0
         self.elapsed = 0.0
         self.best_ever = 0.0
         self.fastest_ever: float | None = None
         self.history: list[float] = []
         self.cars: list[Car] = []
-        # Roads 1..unlocked form the training pool when roads are mixed.
-        self.mix_roads = mix_roads
-        self.unlocked = max(1, unlocked if unlocked is not None else track.level)
-        self.saved_unlocked = saved_unlocked
+        self.champion: Network | None = None
+        self.tracks_completed = 0
+        self.laps_banked = 0  # champion laps finished on this road in earlier heats
+        self.random_phase = False
+        self.saved_tracks = saved_tracks
         self.save_path = save_path
         self._tracks = {track.level: track}
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
             brains = next_generation(ranked, self.rng, POPULATION)
+            self.champion = brains[0]
         else:
             brains = [Network.random(self.sizes, self.rng) for _ in range(POPULATION)]
         self._spawn(brains)
@@ -375,27 +387,55 @@ class Race:
             self._tracks[level] = Track(level)
         return self._tracks[level]
 
-    def _save_champions(self, ranked: list[tuple[tuple[int, float, float], Network]]) -> None:
-        """Persist the two best drivers, but never trade a proven model for a weaker run."""
-        if not self.save_path or self.unlocked < self.saved_unlocked:
-            return
-        best = sorted(ranked, key=lambda item: item[0], reverse=True)[:2]
-        if best[0][0][0] != 1:  # nobody completed a lap
+    @property
+    def laps_required(self) -> int:
+        return FINAL_ROAD_LAPS if self.track.level == len(ROAD_SPECS) else LAPS_PER_ROAD
+
+    @property
+    def heat_limit(self) -> int:
+        if self.track.level == len(ROAD_SPECS):
+            return max(FINAL_ROAD_RUNTIME, self.max_runtime)
+        return self.max_runtime
+
+    @property
+    def champion_car(self) -> Car | None:
+        return self.cars[0] if self.champion is not None else None
+
+    @property
+    def champion_laps(self) -> int:
+        car = self.champion_car
+        return self.laps_banked + (car.laps_completed if car else 0)
+
+    def _reset_gauntlet(self) -> None:
+        self.tracks_completed = 0
+        self.laps_banked = 0
+        self.random_phase = False
+
+    def _beats(self, challenger: Car, champion: Car) -> bool:
+        if challenger.fastest_lap is not None:
+            return champion.fastest_lap is None or challenger.fastest_lap < champion.fastest_lap * (1 - BEAT_MARGIN)
+        if champion.fastest_lap is not None:
+            return False
+        return challenger.best_progress > champion.best_progress * (1 + BEAT_MARGIN)
+
+    def _save_champion(self, networks: list[Network]) -> None:
+        """Persist the champion, but only for a new record of completed tracks."""
+        if not self.save_path or self.tracks_completed <= self.saved_tracks:
             return
         try:
-            save_networks(self.save_path, [network for _, network in best], self.unlocked)
+            save_networks(self.save_path, networks, self.tracks_completed)
         except OSError:
             return
-        self.saved_unlocked = self.unlocked
+        self.saved_tracks = self.tracks_completed
 
     def change_track(self, track: Track) -> None:
-        """Re-run this generation on another circuit, keeping its networks."""
+        """Jump to another road: the heat restarts and the gauntlet begins there."""
         self.track = track
         self._tracks.setdefault(track.level, track)
         self.best_ever = 0.0
         self.fastest_ever = None
         self.history.clear()
-        self.lap_streak = 0
+        self._reset_gauntlet()
         self._spawn([car.brain for car in self.cars])
 
     def update(self, dt: float) -> None:
@@ -409,35 +449,49 @@ class Race:
                     car.fastest_lap if self.fastest_ever is None
                     else min(self.fastest_ever, car.fastest_lap)
                 )
-        time_expired = self.time_limit_enabled and self.elapsed >= self.max_runtime
-        if time_expired or not any(car.alive for car in self.cars):
-            ranked = [(car.rank_key, car.brain) for car in self.cars]
-            self.history.append(max(car.best_progress for car in self.cars))
-            self.history = self.history[-40:]
-            completed_lap = any(car.fastest_lap is not None for car in self.cars)
-            self.lap_streak = min(LAP_GENERATIONS_TO_ADVANCE, self.lap_streak + 1) if completed_lap else 0
-            brains = next_generation(ranked, self.rng, POPULATION)
-            self._save_champions(ranked)
-            next_level = self.track.level
-            if self.lap_streak == LAP_GENERATIONS_TO_ADVANCE:
-                if self.mix_roads and self.unlocked < len(ROAD_SPECS):
-                    self.unlocked += 1
-                    next_level = self.unlocked
-                    self.lap_streak = 0
-                elif not self.mix_roads and self.track.level < len(ROAD_SPECS):
-                    next_level = self.track.level + 1
-                    self.unlocked = max(self.unlocked, next_level)
-                    self.lap_streak = 0
-            if next_level == self.track.level and self.mix_roads:
-                # Every generation may face a different unlocked road.
-                next_level = self.rng.randint(1, self.unlocked)
-            if next_level != self.track.level:
-                self.track = self.track_for(next_level)
-                self.best_ever = 0.0
-                self.fastest_ever = None
-                self.history.clear()
-            self._spawn(brains)
-            self.generation += 1
+        goal = self.champion is not None and self.champion_laps >= self.laps_required
+        time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
+        if goal or time_expired or not any(car.alive for car in self.cars):
+            self._end_heat(goal)
+
+    def _end_heat(self, goal: bool) -> None:
+        ranked = [(car.rank_key, car.brain) for car in self.cars]
+        self.history.append(max(car.best_progress for car in self.cars))
+        self.history = self.history[-40:]
+        brains = next_generation(ranked, self.rng, POPULATION)
+        champion_car = self.champion_car
+        next_level = 1
+        if champion_car is None:
+            self.champion = brains[0]
+            self._reset_gauntlet()
+        else:
+            best = max(self.cars, key=lambda car: car.rank_key)
+            crashed = not champion_car.alive and not goal
+            if crashed or (best is not champion_car and self._beats(best, champion_car)):
+                # Crash, or a clearly better car: new champion, back to road 1.
+                self.champion = brains[0]
+                self._reset_gauntlet()
+            else:
+                brains[0] = self.champion  # the champion always survives unchanged
+                next_level = self.track.level
+                if goal:
+                    self.tracks_completed += 1
+                    self.laps_banked = 0
+                    self._save_champion([self.champion, brains[1]])
+                    if self.random_phase or self.track.level == len(ROAD_SPECS):
+                        self.random_phase = True
+                        next_level = self.rng.randint(1, len(ROAD_SPECS))
+                    else:
+                        next_level = self.track.level + 1
+                else:
+                    self.laps_banked += champion_car.laps_completed
+        if next_level != self.track.level:
+            self.track = self.track_for(next_level)
+            self.best_ever = 0.0
+            self.fastest_ever = None
+            self.history.clear()
+        self._spawn(brains)
+        self.generation += 1
 
     @property
     def leader(self) -> Car | None:
@@ -463,22 +517,21 @@ class App:
         self.bold = pygame.font.SysFont("Avenir Next", 20, bold=True)
         self.title = pygame.font.SysFont("Avenir Next", 32, bold=True)
         self.save_path = save_path or SAVE_PATH
-        self.mix_roads = True
         self.inputs = 7
         self.hidden = [DEFAULT_HIDDEN_WIDTH, DEFAULT_HIDDEN_WIDTH]
         self.max_runtime = DEFAULT_MAX_RUNTIME
         self.time_limit_enabled = True
         # Resume from the saved champions when possible, otherwise start from scratch.
         saved = load_networks(self.save_path)
-        seed, unlocked = None, 1
+        seed, saved_tracks = None, 0
         if saved:
-            seed, unlocked = saved
+            seed, saved_tracks = saved
             self.inputs, self.hidden = seed[0].sizes[0], list(seed[0].sizes[1:-1])
-        self.road_level = random.randint(1, unlocked)
+        self.road_level = 1  # the gauntlet always starts on road 1
         self.track = Track(self.road_level)
         self.race = Race(
             self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
-            self.mix_roads, seed, unlocked, unlocked if saved else 0, self.save_path,
+            seed, saved_tracks, self.save_path,
         )
         self.paused = False
         self.speed = 4
@@ -516,15 +569,13 @@ class App:
         elif action == "limit":
             self.time_limit_enabled = not self.time_limit_enabled
             self.race.time_limit_enabled = self.time_limit_enabled
-        elif action == "mix":
-            self.mix_roads = not self.mix_roads
-            self.race.mix_roads = self.mix_roads
         elif action == "apply":
-            # A fresh start; the saved file is only replaced once this run catches up.
+            # A fresh start on road 1; the saved file is only replaced by a new record.
+            self.road_level = 1
+            self.track = Track(self.road_level)
             self.race = Race(
                 self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
-                self.mix_roads, unlocked=1, saved_unlocked=self.race.saved_unlocked,
-                save_path=self.save_path,
+                saved_tracks=self.race.saved_tracks, save_path=self.save_path,
             )
             self.paused = False
         elif action == "inspect":
@@ -579,14 +630,17 @@ class App:
     def draw_world(self) -> None:
         self.screen.blit(self.track.art, (0, 0))
         self.draw_cars()
-        pygame.draw.rect(self.screen, (11, 22, 30), (22, 22, 233, 88), border_radius=12)
+        pygame.draw.rect(self.screen, (11, 22, 30), (22, 22, 233, 140), border_radius=12)
         self.label("NEURAL CIRCUIT", 37, 32, ACCENT, self.small)
         self.label(f"Generation {self.race.generation:02d}", 37, 56, TEXT, self.bold)
         alive = sum(car.alive for car in self.race.cars)
         self.label(f"{alive:02d} / {POPULATION} cars on track", 38, 84, MUTED, self.small)
+        self.label(f"Tracks completed: {self.race.tracks_completed}", 37, 108, ACCENT, self.font)
+        lap_text = f"Lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
+        self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), 38, 133, MUTED, self.small)
 
         pygame.draw.rect(self.screen, (11, 22, 30), (22, HEIGHT - 58, 580, 37), border_radius=8)
-        self.label("P  pause   R  restart   V  sensors   M  mix roads   TAB  speed   ARROWS  road", 36, HEIGHT - 49, MUTED, self.small)
+        self.label("P  pause     R  restart     V  sensors     TAB  speed     ARROWS  road", 36, HEIGHT - 49, MUTED, self.small)
         if self.paused:
             shade = pygame.Surface((WORLD_W, HEIGHT), pygame.SRCALPHA)
             shade.fill((5, 15, 20, 100))
@@ -631,26 +685,22 @@ class App:
         road_name = self.small.render(self.track.name, True, MUTED)
         self.screen.blit(road_name, road_name.get_rect(center=(x + 180, 345)))
         auto_text = (
-            f"Unlock next road: {self.race.lap_streak}/{LAP_GENERATIONS_TO_ADVANCE} lap generations"
-            f"  (roads 1–{self.race.unlocked} open)"
-            if self.race.unlocked < len(ROAD_SPECS) else f"All {len(ROAD_SPECS)} roads open"
+            f"Tracks completed: {self.race.tracks_completed}  •  "
+            f"lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
+            + ("  •  random roads" if self.race.random_phase else "")
         )
         self.label(auto_text, x + 23, 357, MUTED, self.tiny)
         self.stepper(374, "Max runtime (seconds)", self.max_runtime, "runtime")
         self.button(
-            pygame.Rect(x + 22, 407, 100, 27),
+            pygame.Rect(x + 22, 407, 133, 27),
             "LIMIT ON" if self.time_limit_enabled else "LIMIT OFF", "limit",
             primary=not self.time_limit_enabled,
         )
-        self.button(
-            pygame.Rect(x + 128, 407, 100, 27),
-            "MIX ON" if self.mix_roads else "MIX OFF", "mix", primary=self.mix_roads,
-        )
         heat_text = (
-            f"Heat {self.race.elapsed:.1f} / {self.max_runtime} s"
+            f"Heat {self.race.elapsed:.1f} / {self.race.heat_limit} s"
             if self.time_limit_enabled else f"Heat {self.race.elapsed:.1f} s"
         )
-        self.label(heat_text, x + 236, 411, MUTED, self.tiny)
+        self.label(heat_text, x + 166, 411, MUTED, self.small)
 
         pygame.draw.line(self.screen, (46, 65, 72), (x + 22, 443), (WIDTH - 22, 443))
         self.label("NETWORK SETUP", x + 23, 451, ACCENT, self.small)
@@ -690,8 +740,6 @@ class App:
                         self.handle_action("pause")
                     elif event.key == pygame.K_r:
                         self.handle_action("apply")
-                    elif event.key == pygame.K_m:
-                        self.handle_action("mix")
                     elif event.key == pygame.K_v:
                         self.show_sensors = not self.show_sensors
                     elif event.key == pygame.K_TAB:
