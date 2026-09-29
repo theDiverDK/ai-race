@@ -1,6 +1,9 @@
 import os
 import math
+import random
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -8,7 +11,9 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
 
+import main
 from main import App, Car, POPULATION, ROAD_SPECS, Race, Track, WORLD_W
+from neural import Network, load_networks, save_networks
 
 
 class RaceTests(unittest.TestCase):
@@ -19,6 +24,15 @@ class RaceTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pygame.quit()
+
+    def setUp(self):
+        # Never touch the real best_network.json from tests.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.save_path = Path(directory.name) / "best_network.json"
+        patcher = patch.object(main, "SAVE_PATH", self.save_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_distinct_drivable_roads_with_both_turns_and_pinches(self):
         self.assertEqual(len(ROAD_SPECS), 11)
@@ -242,7 +256,7 @@ class RaceTests(unittest.TestCase):
         self.assertEqual(race.track.level, 3)
 
     def test_final_road_does_not_wrap_after_five_lap_generations(self):
-        race = Race(Track(11), 7, [8], max_runtime=5)
+        race = Race(Track(11), 7, [8], max_runtime=5, mix_roads=False)
 
         def one_car_completes_lap(car, track, dt):
             if car is race.cars[0]:
@@ -292,6 +306,96 @@ class RaceTests(unittest.TestCase):
             race.cars[0].alive = False
             race.update(0)
             self.assertEqual(race.generation, 2)
+
+    def one_lap_runner(self, race):
+        def one_car_completes_lap(car, track, dt):
+            if car is race.cars[0]:
+                car.best_progress = track.length
+                car.fastest_lap = 5.0
+        return patch.object(Car, "update", one_car_completes_lap)
+
+    def test_mixed_roads_draw_from_unlocked_pool_only(self):
+        race = Race(Track(1), 7, [8], max_runtime=5, unlocked=3)
+        seen = set()
+        with patch.object(Car, "update", return_value=None):
+            for _ in range(60):
+                race.update(5)
+                seen.add(race.track.level)
+        self.assertEqual(seen, {1, 2, 3})
+
+    def test_mix_off_stays_on_the_selected_road(self):
+        race = Race(Track(2), 7, [8], max_runtime=5, mix_roads=False, unlocked=5)
+        with patch.object(Car, "update", return_value=None):
+            for _ in range(10):
+                race.update(5)
+                self.assertEqual(race.track.level, 2)
+
+    def test_lap_streak_unlocks_next_road_in_mixed_mode(self):
+        race = Race(Track(1), 7, [8], max_runtime=5)
+        with self.one_lap_runner(race):
+            for _ in range(5):
+                race.update(5)
+        self.assertEqual(race.unlocked, 2)
+        self.assertEqual(race.track.level, 2)
+        self.assertEqual(race.lap_streak, 0)
+
+    def test_next_generation_keeps_champions_and_adds_minor_mutants(self):
+        from neural import next_generation
+        rng = random.Random(3)
+        ranked = [((0, float(i), 0.0), Network.random((5, 6, 3), rng)) for i in range(12)]
+        offspring = next_generation(ranked, rng, 12)
+        first, second = ranked[-1][1], ranked[-2][1]
+        self.assertEqual(offspring[0].weights, first.weights)
+        self.assertEqual(offspring[1].weights, second.weights)
+        for mutant, parent in ((offspring[2], first), (offspring[3], second)):
+            self.assertNotEqual(mutant.weights, parent.weights)
+            diffs = [abs(a - b) for la, lb in zip(mutant.weights, parent.weights)
+                     for ra, rb in zip(la, lb) for a, b in zip(ra, rb)]
+            self.assertLess(max(diffs), 0.3)
+
+    def test_save_and_load_round_trip_and_bad_files(self):
+        brains = [Network.random((5, 6, 3), random.Random(i)) for i in range(2)]
+        save_networks(self.save_path, brains, 4)
+        loaded, unlocked = load_networks(self.save_path)
+        self.assertEqual(unlocked, 4)
+        self.assertEqual([b.weights for b in loaded], [b.weights for b in brains])
+        self.assertIsNone(load_networks(self.save_path.with_name("missing.json")))
+        self.save_path.write_text("not json")
+        self.assertIsNone(load_networks(self.save_path))
+        self.save_path.write_text('{"version": 1, "unlocked": 1, "networks": [{"sizes": [5, 3], "weights": [[[1]]], "biases": [[0, 0, 0]]}]}')
+        self.assertIsNone(load_networks(self.save_path))
+
+    def test_app_starts_from_scratch_without_file_and_saves_after_a_lap(self):
+        app = App()
+        self.assertEqual(app.race.saved_unlocked, 0)
+        self.assertFalse(self.save_path.exists())
+        app.race.elapsed = app.race.max_runtime
+        with self.one_lap_runner(app.race):
+            app.race.update(0)
+        loaded, unlocked = load_networks(self.save_path)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(unlocked, 1)
+
+    def test_app_loads_saved_network_and_adopts_its_architecture(self):
+        brains = [Network.random((5, 6, 4, 3), random.Random(i)) for i in range(2)]
+        save_networks(self.save_path, brains, 3)
+        app = App()
+        self.assertEqual((app.inputs, app.hidden), (5, [6, 4]))
+        self.assertEqual(app.race.unlocked, 3)
+        self.assertLessEqual(app.race.track.level, 3)
+        self.assertEqual(app.race.cars[0].brain.weights, brains[0].weights)
+        self.assertEqual(app.race.cars[1].brain.weights, brains[1].weights)
+        self.assertEqual(len(app.race.cars), POPULATION)
+
+    def test_weaker_run_does_not_overwrite_a_more_advanced_save(self):
+        brains = [Network.random((7, 8, 3), random.Random(i)) for i in range(2)]
+        save_networks(self.save_path, brains, 6)
+        app = App()
+        app.handle_action("apply")  # fresh start, unlocked back to 1
+        app.race.elapsed = app.race.max_runtime
+        with self.one_lap_runner(app.race):
+            app.race.update(0)
+        self.assertEqual(load_networks(self.save_path)[1], 6)
 
 
 if __name__ == "__main__":

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 
 WEIGHT_MUTATION_STD = 0.15
 BIAS_MUTATION_STD = 0.10
+MINOR_WEIGHT_STD = 0.03
+MINOR_BIAS_STD = 0.02
+MINOR_MUTATION_RATE = 0.10
+SAVE_VERSION = 1
 
 
 @dataclass
@@ -51,6 +57,35 @@ class Network:
             [layer[:] for layer in self.biases],
         )
 
+    def minor_mutation(self, rng: random.Random) -> "Network":
+        """A near-copy: a few small nudges, never a crossover."""
+        clone = self.copy()
+        for layer in clone.weights:
+            for row in layer:
+                for index, value in enumerate(row):
+                    if rng.random() < MINOR_MUTATION_RATE:
+                        row[index] = value + rng.gauss(0, MINOR_WEIGHT_STD)
+        for layer in clone.biases:
+            for index, value in enumerate(layer):
+                if rng.random() < MINOR_MUTATION_RATE:
+                    layer[index] = value + rng.gauss(0, MINOR_BIAS_STD)
+        return clone
+
+    def to_dict(self) -> dict:
+        return {"sizes": list(self.sizes), "weights": self.weights, "biases": self.biases}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Network":
+        sizes = tuple(int(size) for size in data["sizes"])
+        weights = [[[float(v) for v in row] for row in layer] for layer in data["weights"]]
+        biases = [[float(v) for v in layer] for layer in data["biases"]]
+        if len(sizes) < 2 or sizes[-1] != 3 or len(weights) != len(sizes) - 1 or len(biases) != len(weights):
+            raise ValueError("Malformed network")
+        for (inputs, outputs), layer, bias in zip(zip(sizes, sizes[1:]), weights, biases):
+            if len(layer) != outputs or len(bias) != outputs or any(len(row) != inputs for row in layer):
+                raise ValueError("Network shape does not match its layer sizes")
+        return cls(sizes, weights, biases)
+
     def child(self, other: "Network", rng: random.Random) -> "Network":
         if self.sizes != other.sizes:
             raise ValueError("Parents must have the same architecture")
@@ -76,12 +111,16 @@ class Network:
 def next_generation(
     ranked: list[tuple[tuple[int, float, float], Network]], rng: random.Random, population: int
 ) -> list[Network]:
-    """Keep champions, breed from strong drivers, and add some newcomers."""
+    """Keep the two champions unchanged, add two lightly mutated copies of
+    them, breed from strong drivers, and add some newcomers."""
     if not ranked or population < 4:
         raise ValueError("A ranked population of at least four cars is required")
     ranked = sorted(ranked, key=lambda item: item[0], reverse=True)
     pool = [network for _, network in ranked[: max(4, population // 4)]]
-    result = [network.copy() for network in pool[:2]]
+    elites = pool[:2]
+    result = [network.copy() for network in elites]
+    # Two near-copies of the champions explore the neighbourhood of what works.
+    result += [elites[i % len(elites)].minor_mutation(rng) for i in range(2)]
     newcomers = max(2, population // 10)
     while len(result) < population - newcomers:
         a = pool[min(int(rng.random() ** 2 * len(pool)), len(pool) - 1)]
@@ -90,3 +129,30 @@ def next_generation(
     while len(result) < population:
         result.append(Network.random(pool[0].sizes, rng))
     return result
+
+
+def save_networks(path: Path, networks: list[Network], unlocked: int) -> None:
+    """Write the champions atomically so a crash never corrupts the file."""
+    payload = {
+        "version": SAVE_VERSION,
+        "unlocked": unlocked,
+        "networks": [network.to_dict() for network in networks],
+    }
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload))
+    temporary.replace(path)
+
+
+def load_networks(path: Path) -> tuple[list[Network], int] | None:
+    """Return (champions, unlocked road), or None if missing or unusable."""
+    try:
+        payload = json.loads(Path(path).read_text())
+        if payload["version"] != SAVE_VERSION:
+            return None
+        networks = [Network.from_dict(item) for item in payload["networks"]]
+        if not networks or len({network.sizes for network in networks}) != 1:
+            return None
+        return networks, max(1, int(payload["unlocked"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None

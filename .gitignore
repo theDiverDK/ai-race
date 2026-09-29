@@ -1,3 +1,5 @@
 .venv/
 __pycache__/
 *.pyc
+best_network.json
+best_network.json.tmp
