@@ -108,6 +108,23 @@ class Network:
         return child
 
 
+def newcomer_count(population: int) -> int:
+    return max(2, population // 10)
+
+
+def slot_role(index: int, population: int) -> str:
+    """How the car in this slot of a new generation was made by next_generation()."""
+    if index == 0:
+        return "champion"
+    if index == 1:
+        return "runner_up"
+    if index < 4:
+        return "mutant"
+    if index >= population - newcomer_count(population):
+        return "newcomer"
+    return "child"
+
+
 def next_generation(
     ranked: list[tuple[tuple[int, float, float], Network]], rng: random.Random, population: int
 ) -> list[Network]:
@@ -121,7 +138,7 @@ def next_generation(
     result = [network.copy() for network in elites]
     # Two near-copies of the champions explore the neighbourhood of what works.
     result += [elites[i % len(elites)].minor_mutation(rng) for i in range(2)]
-    newcomers = max(2, population // 10)
+    newcomers = newcomer_count(population)
     while len(result) < population - newcomers:
         a = pool[min(int(rng.random() ** 2 * len(pool)), len(pool) - 1)]
         b = pool[min(int(rng.random() ** 2 * len(pool)), len(pool) - 1)]

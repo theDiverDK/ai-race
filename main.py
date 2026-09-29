@@ -11,7 +11,7 @@ import pygame
 from pygame._sdl2.video import Window
 
 from inspector import NetworkInspector
-from neural import Network, load_networks, next_generation, save_networks
+from neural import Network, load_networks, next_generation, save_networks, slot_role
 
 
 WORLD_W, HEIGHT, PANEL_W = 900, 800, 360
@@ -34,6 +34,13 @@ SCORE_LAP_POINTS = 100
 SCORE_PACE_POINTS = 50
 SCORE_ROAD_BONUS = 0.10
 TOP_SPEED = 220.0
+HOW_MADE = {
+    "champion": "the unchanged champion",
+    "runner_up": "the runner-up, an unchanged copy of the 2nd best",
+    "mutant": "a lightly mutated copy of a top car",
+    "child": "a bred child of two top cars (crossover + mutation)",
+    "newcomer": "a brand-new random network",
+}
 SENSOR_NOISE = 0.02
 START_ANGLE_JITTER = 0.10
 SAVE_PATH = Path(__file__).with_name("best_network.json")
@@ -387,6 +394,9 @@ class Race:
         self.saved_best_score = best_score
         self.record_tracks = record_tracks
         self.record_brain = record_brain or (seed_networks[0] if seed_networks else None)
+        # Slots only mean something once a generation was bred from ranked parents.
+        self.roles_known = bool(seed_networks)
+        self.last_result: tuple[str, str] | None = None  # who won the previous generation
         self._tracks = {track.level: track}
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
@@ -473,6 +483,7 @@ class Race:
         self.fastest_ever = None
         self.history.clear()
         self._reset_gauntlet()
+        self.last_result = None
         self._spawn([car.brain for car in self.cars])
 
     def update(self, dt: float) -> None:
@@ -494,7 +505,11 @@ class Race:
             self.record_brain = (champion_car or max(self.cars, key=lambda car: car.score_on(self.track))).brain
         goal = self.champion is not None and self.champion_laps >= self.laps_required
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
-        if goal or time_expired or not any(car.alive for car in self.cars):
+        # A crashed champion has already lost the run, so its score can no longer
+        # change: end the heat now instead of racing on with a frozen score.
+        champion_car = self.champion_car
+        champion_crashed = champion_car is not None and not champion_car.alive
+        if goal or champion_crashed or time_expired or not any(car.alive for car in self.cars):
             self._end_heat(goal)
 
     def _end_heat(self, goal: bool) -> None:
@@ -504,10 +519,17 @@ class Race:
         brains = next_generation(ranked, self.rng, POPULATION)
         self.save_now()
         champion_car = self.champion_car
+        winner = max(self.cars, key=lambda car: car.rank_key)
+        if self.roles_known:
+            winner_text = HOW_MADE[slot_role(self.cars.index(winner), POPULATION)]
+        else:
+            winner_text = "a random starting network"
+        headline = f"Generation {self.generation} was won by {winner_text}."
         next_level = 1
         if champion_car is None:
             self.champion = brains[0]
             self._reset_gauntlet()
+            outcome = "It is the first champion; the run starts on road 1."
         else:
             best = max(self.cars, key=lambda car: car.rank_key)
             crashed = not champion_car.alive and not goal
@@ -515,13 +537,20 @@ class Race:
                 # Crash, or a clearly better car: new champion, back to road 1.
                 self.champion = brains[0]
                 self._reset_gauntlet()
+                outcome = (
+                    "The champion crashed, so the best car of the heat is the new champion; back to road 1."
+                    if crashed else
+                    "It beat the champion by enough to take over; back to road 1."
+                )
             else:
+                outcome = "The champion keeps its title."
                 brains[0] = self.champion  # the champion always survives unchanged
                 next_level = self.track.level
                 self.run_banked += champion_car.lap_score(self.track)
                 if goal:
                     self.tracks_completed += 1
                     self.laps_banked = 0
+                    outcome = f"The champion finished road {self.track.level} and has now completed {self.tracks_completed}."
                     if self.random_phase or self.track.level == len(ROAD_SPECS):
                         self.random_phase = True
                         next_level = self.rng.randint(1, len(ROAD_SPECS))
@@ -536,6 +565,9 @@ class Race:
             self.history.clear()
         self._spawn(brains)
         self.generation += 1
+        self.roles_known = True
+        self.last_result = (headline, outcome)
+        self.current_score = self.run_score
 
     @property
     def leader(self) -> Car | None:
@@ -683,12 +715,12 @@ class App:
         self.label(f"Tracks completed: {self.race.tracks_completed}", 37, 108, ACCENT, self.font)
         lap_text = f"Lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
         self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), 38, 133, MUTED, self.small)
-        at_record = self.race.current_score >= self.race.best_score_ever > 0
-        self.label(f"Run score: {self.race.current_score:,.0f}", 37, 160, ACCENT if at_record else ORANGE, self.font)
-        self.label(
-            f"Best score ever: {self.race.best_score_ever:,.0f}" + ("  NEW RECORD" if at_record else ""),
-            38, 186, ACCENT if at_record else MUTED, self.small,
-        )
+        self.label(f"Run score: {self.race.current_score:,.0f}", 37, 160, ORANGE, self.font)
+        self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", 38, 186, MUTED, self.small)
+        if self.race.last_result:
+            pygame.draw.rect(self.screen, (11, 22, 30), (22, HEIGHT - 116, 640, 50), border_radius=8)
+            self.label(self.race.last_result[0], 36, HEIGHT - 110, TEXT, self.small)
+            self.label(self.race.last_result[1], 36, HEIGHT - 89, MUTED, self.small)
 
         pygame.draw.rect(self.screen, (11, 22, 30), (22, HEIGHT - 58, 580, 37), border_radius=8)
         self.label("P  pause     R  restart     V  sensors     TAB  speed     ARROWS  road", 36, HEIGHT - 49, MUTED, self.small)

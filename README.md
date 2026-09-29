@@ -41,11 +41,15 @@ The counter resets to 0 and training restarts on Road 1 whenever the champion cr
 
 To avoid overfitting one road, sensor readings carry a little noise and cars start with a small random heading and offset.
 
+### Who won the last generation
+
+When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. A second line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). A champion crash ends the heat at once, since the run is already lost and its score cannot change.
+
 ### Score
 
 A higher score means a better model, so the score belongs to the champion's run rather than to a single heat. Each finished lap earns 100 points plus up to 50 for pace (its lap time against top speed), the lap in progress earns a fraction of 100, and everything is multiplied by `1 + 0.1 × (road − 1)` so later roads are worth more. The **Run score** adds this up across every road the champion completes in a row, so it only grows while the champion keeps driving and keeps going into the random-road phase.
 
-The run score resets to 0 when the champion is dethroned or crashes (the same moment the tracks counter resets). **Best score ever** never resets: it is the highest run score any model has reached, and it turns green with **NEW RECORD** while the current run is at it. Before the first champion exists, the score is that of the best car.
+The run score resets to 0 when the champion is dethroned or crashes (the same moment the tracks counter resets). **Best score ever** never resets: it is the highest run score any model has reached, Before the first champion exists, the score is that of the best car.
 
 ### Saved network
 

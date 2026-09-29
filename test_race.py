@@ -13,7 +13,7 @@ import pygame
 
 import main
 from main import App, Car, POPULATION, ROAD_SPECS, Race, Track, WORLD_W
-from neural import Network, load_networks, save_networks
+from neural import Network, load_networks, save_networks, slot_role
 
 
 class RaceTests(unittest.TestCase):
@@ -451,6 +451,64 @@ class RaceTests(unittest.TestCase):
             self.finish_heat(app.race)
         app.race.save_now()
         self.assertEqual(load_networks(self.save_path).networks[0].weights, champion.weights)
+
+    def test_champion_crash_ends_the_heat_immediately(self):
+        race = self.crowned_race()
+        generation = race.generation
+        with self.gauntlet(race, crash=True):
+            race.update(0.01)  # far from the time limit, other cars still alive
+        self.assertEqual(race.generation, generation + 1)
+        self.assertEqual((race.track.level, race.run_banked), (1, 0))
+        self.assertIn("crashed", race.last_result[1])
+
+    def test_score_never_freezes_while_the_champion_races(self):
+        race = self.crowned_race()
+        scores = []
+
+        def creeping(car, track, dt):
+            if car is race.cars[0] and car.alive:
+                car.best_progress += 1
+        with patch.object(Car, "update", creeping):
+            for _ in range(30):
+                race.update(0.01)
+                scores.append(race.current_score)
+        self.assertEqual(scores, sorted(set(scores)))
+
+    def test_slot_roles_match_how_next_generation_builds_cars(self):
+        roles = [slot_role(i, 50) for i in range(50)]
+        self.assertEqual(roles[:4], ["champion", "runner_up", "mutant", "mutant"])
+        self.assertEqual(roles[4:45], ["child"] * 41)
+        self.assertEqual(roles[45:], ["newcomer"] * 5)
+
+    def test_result_line_says_who_won_and_how_it_was_made(self):
+        race = Race(Track(1), 7, [8], max_runtime=5)
+        with patch.object(Car, "update", return_value=None):
+            self.finish_heat(race)
+        self.assertIn("random starting network", race.last_result[0])
+        self.assertIn("first champion", race.last_result[1])
+
+        def winner_is(slot, lap=5.0):
+            def update(car, track, dt):
+                if car is race.cars[slot]:
+                    car.laps_completed, car.best_progress, car.fastest_lap = 1, track.length, lap
+            return patch.object(Car, "update", update)
+        for slot, text in ((0, "unchanged champion"), (1, "runner-up"), (2, "lightly mutated"),
+                           (20, "bred child"), (48, "brand-new random")):
+            race = self.crowned_race()
+            with winner_is(slot):
+                self.finish_heat(race)
+            self.assertIn(text, race.last_result[0], slot)
+        race = self.crowned_race()
+        with winner_is(20):  # beats a champion that has no lap
+            self.finish_heat(race)
+        self.assertIn("take over", race.last_result[1])
+        race = self.crowned_race()
+        with self.gauntlet(race, laps_per_heat=5):
+            race.update(0.01)
+        self.assertIn("finished road 1", race.last_result[1])
+        app = App()
+        app.race.last_result = ("Generation 3 was won by x.", "y")
+        app.draw_world()
 
     def test_bad_or_missing_save_files_are_ignored(self):
         self.assertIsNone(load_networks(self.save_path))
