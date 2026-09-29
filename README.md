@@ -19,11 +19,10 @@ python main.py
 
 | Control | Action |
 | --- | --- |
-| Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks. |
+| Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks, and restarts the gauntlet there. |
 | Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
 | **Limit On / Limit Off** | Turn the time limit on or off. With it off, the heat continues until every car has left the road or stalled. |
 | Input neurons, hidden layers, layer widths | Change the network design. Click **Apply & Restart** to start a new population with those settings. The output layer always has three neurons. |
-| **Mix On / Mix Off** / `M` | With mixing on (default), every generation runs on a random unlocked road so networks must handle all of them. With it off, training stays on the selected road. |
 | **Pause** / `P` | Pause or resume. |
 | **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Starts at 4×. |
 | `V` | Show or hide the leading car's sensor rays. |
@@ -32,17 +31,37 @@ python main.py
 
 ## How learning works
 
-Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. A car that completes a lap ranks above any car that has not; among finishers, the fastest lap wins. Until a car completes a lap, furthest forward progress determines the ranking. At the end of a heat, the two best networks pass to the next generation unchanged, two lightly mutated copies of them (small nudges, no crossover) follow, most of the rest are bred and mutated from high-ranking cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
+Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. Cars are ranked by fitness (see below). At the end of a heat, the two best networks pass to the next generation unchanged, two lightly mutated copies of them (small nudges, no crossover) follow, most of the rest are bred and mutated from high-ranking cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
 
-### Generalising across roads
+### The gauntlet and the counter
 
-To avoid a network that only knows one road, each generation runs on a random road from the unlocked set (Roads 1 to N), sensor readings carry a little noise, and cars start with a small random heading and offset. Champions are re-tested on a different road every generation, so a driver that only works on one layout drops out.
+The best car (the *champion*) always sits in slot 0 of each generation, unchanged. Training always starts on Road 1. The champion must finish 5 laps on a road (laps carry over between heats) before the next road starts; Roads 1 to 11 run in order, and Road 11 needs 10 laps and gets a 60 second heat. After that, roads are random, and every road the champion completes keeps adding to the **Tracks completed** counter shown on the track and in the panel.
 
-If at least one car finishes a full lap in each of five consecutive generations, the next road unlocks and is used for the next generation. A generation without a full lap resets the count. Road 11 is the last road. With **Mix Off**, the old behaviour applies: training stays on the selected road and moves to the next one after five lap generations.
+The counter resets to 0 and training restarts on Road 1 whenever the champion crashes (leaves the road or stalls) or another car is clearly fitter: at least 3% higher fitness (see below). The best car of that generation becomes the new champion. Jumping to another road with the road arrows also resets the counter and starts the gauntlet from that road.
+
+### Learning to drive, not to remember a road
+
+A network that only fits one road, or one direction of it, would look good in a single race and then fail elsewhere. Three things prevent that:
+
+- **Probe roads.** In every heat each network also drives two hidden probe roads at the same time, with its own random start: the shown road in a different orientation, and a nearby road (at most one ahead of the current one). Probe roads are simulated, not drawn; the note at the bottom left lists them.
+- **Mirrored and reversed roads.** Every road exists in four orientations: original, mirrored (left turns become right turns), reversed (driven the other way round) and both. A network that just leans one way cannot pass all four. After Road 11 the shown road is random in road and orientation too.
+- **Fitness across all roads.** Selection uses `0.5 × average + 0.5 × worst` of the distance driven on the shown road and both probe roads, scaled to the same units on every road. A specialist that is brilliant on one road and crashes on the others loses to an all-rounder. The champion's 5-lap gauntlet on 11 different roads is the final exam.
+
+Sensor readings also carry a little noise, and cars start with a small random heading and offset.
+
+### Who won the last generation
+
+When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. A second line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). When the champion crashes the heat carries on until the time limit or the last car stops, and the score switches to the best car still racing, starting from zero, and the note appears when the heat ends.
+
+### Score
+
+A higher score means a better model, so the score belongs to the champion's run rather than to a single heat. Each finished lap earns 100 points plus up to 50 for pace (its lap time against top speed), the lap in progress earns a fraction of 100, and everything is multiplied by `1 + 0.1 × (road − 1)` so later roads are worth more. The **Run score** adds this up across every road the champion completes in a row, so it only grows while the champion keeps driving and keeps going into the random-road phase.
+
+The run score resets to 0 when the champion is dethroned or crashes (the same moment the tracks counter resets). **Best score ever** never resets: it is the highest run score any model has reached, Before the first champion exists, the score is that of the best car.
 
 ### Saved network
 
-When a generation ends with at least one full lap, the two best networks are saved to `best_network.json` (git-ignored), along with how many roads are unlocked. On startup the app loads that file, adopts its network layout, and seeds the population from it; if the file is missing or unreadable it starts from scratch. **Restart Training** (`R`) always starts from scratch, and the file is only replaced again once the new run has unlocked as many roads as the saved one, so a restart does not wipe a good model.
+The model that set the best score ever is saved to `best_network.json` (git-ignored), together with the score and how many tracks that run completed. It is written when a heat ends with a new record and again on quit. On startup the app loads it, adopts its network layout, seeds the population from it and starts on Road 1; if the file is missing or unreadable it starts from scratch. **Restart Training** (`R`) starts from scratch but keeps the record, and the file is only replaced when a new model beats the saved score.
 
 To run the checks:
 

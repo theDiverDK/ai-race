@@ -6,6 +6,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from operator import mul
 from pathlib import Path
 
 
@@ -14,7 +15,7 @@ BIAS_MUTATION_STD = 0.10
 MINOR_WEIGHT_STD = 0.03
 MINOR_BIAS_STD = 0.02
 MINOR_MUTATION_RATE = 0.10
-SAVE_VERSION = 1
+SAVE_VERSION = 2
 
 
 @dataclass
@@ -43,11 +44,11 @@ class Network:
         if len(inputs) != self.sizes[0]:
             raise ValueError(f"Expected {self.sizes[0]} inputs, got {len(inputs)}")
         values = inputs
+        tanh = math.tanh
         for weights, biases in zip(self.weights, self.biases):
-            values = [
-                math.tanh(sum(weight * value for weight, value in zip(row, values)) + bias)
-                for row, bias in zip(weights, biases)
-            ]
+            # sum(map(mul, ...)) is several times faster than a generator here,
+            # and this runs for every car on every simulation step.
+            values = [tanh(sum(map(mul, row, values)) + bias) for row, bias in zip(weights, biases)]
         return values[0], values[1], values[2]
 
     def copy(self) -> "Network":
@@ -108,6 +109,23 @@ class Network:
         return child
 
 
+def newcomer_count(population: int) -> int:
+    return max(2, population // 10)
+
+
+def slot_role(index: int, population: int) -> str:
+    """How the car in this slot of a new generation was made by next_generation()."""
+    if index == 0:
+        return "champion"
+    if index == 1:
+        return "runner_up"
+    if index < 4:
+        return "mutant"
+    if index >= population - newcomer_count(population):
+        return "newcomer"
+    return "child"
+
+
 def next_generation(
     ranked: list[tuple[tuple[int, float, float], Network]], rng: random.Random, population: int
 ) -> list[Network]:
@@ -121,7 +139,7 @@ def next_generation(
     result = [network.copy() for network in elites]
     # Two near-copies of the champions explore the neighbourhood of what works.
     result += [elites[i % len(elites)].minor_mutation(rng) for i in range(2)]
-    newcomers = max(2, population // 10)
+    newcomers = newcomer_count(population)
     while len(result) < population - newcomers:
         a = pool[min(int(rng.random() ** 2 * len(pool)), len(pool) - 1)]
         b = pool[min(int(rng.random() ** 2 * len(pool)), len(pool) - 1)]
@@ -131,11 +149,21 @@ def next_generation(
     return result
 
 
-def save_networks(path: Path, networks: list[Network], unlocked: int) -> None:
+@dataclass
+class SaveData:
+    networks: list[Network]
+    tracks_completed: int = 0
+    best_score: float = 0.0
+
+
+def save_networks(
+    path: Path, networks: list[Network], tracks_completed: int, best_score: float = 0.0
+) -> None:
     """Write the champions atomically so a crash never corrupts the file."""
     payload = {
         "version": SAVE_VERSION,
-        "unlocked": unlocked,
+        "tracks_completed": tracks_completed,
+        "best_score": best_score,
         "networks": [network.to_dict() for network in networks],
     }
     path = Path(path)
@@ -144,8 +172,8 @@ def save_networks(path: Path, networks: list[Network], unlocked: int) -> None:
     temporary.replace(path)
 
 
-def load_networks(path: Path) -> tuple[list[Network], int] | None:
-    """Return (champions, unlocked road), or None if missing or unusable."""
+def load_networks(path: Path) -> SaveData | None:
+    """Return the saved champions and records, or None if missing or unusable."""
     try:
         payload = json.loads(Path(path).read_text())
         if payload["version"] != SAVE_VERSION:
@@ -153,6 +181,10 @@ def load_networks(path: Path) -> tuple[list[Network], int] | None:
         networks = [Network.from_dict(item) for item in payload["networks"]]
         if not networks or len({network.sizes for network in networks}) != 1:
             return None
-        return networks, max(1, int(payload["unlocked"]))
+        return SaveData(
+            networks,
+            max(0, int(payload["tracks_completed"])),
+            max(0.0, float(payload.get("best_score", 0.0))),
+        )
     except (OSError, ValueError, KeyError, TypeError):
         return None
