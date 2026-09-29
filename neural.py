@@ -6,6 +6,7 @@ import json
 import math
 import random
 from dataclasses import dataclass
+from operator import mul
 from pathlib import Path
 
 
@@ -43,11 +44,11 @@ class Network:
         if len(inputs) != self.sizes[0]:
             raise ValueError(f"Expected {self.sizes[0]} inputs, got {len(inputs)}")
         values = inputs
+        tanh = math.tanh
         for weights, biases in zip(self.weights, self.biases):
-            values = [
-                math.tanh(sum(weight * value for weight, value in zip(row, values)) + bias)
-                for row, bias in zip(weights, biases)
-            ]
+            # sum(map(mul, ...)) is several times faster than a generator here,
+            # and this runs for every car on every simulation step.
+            values = [tanh(sum(map(mul, row, values)) + bias) for row, bias in zip(weights, biases)]
         return values[0], values[1], values[2]
 
     def copy(self) -> "Network":

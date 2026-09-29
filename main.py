@@ -222,12 +222,16 @@ class Track:
         # Every input neuron corresponds to one evenly spaced road-edge ray.
         spread = math.radians(105)
         values = []
+        get_at = self.mask.get_at  # inlined on_road(): this loop is the hottest code in the app
+        width, height = WORLD_W, HEIGHT
+        steps = range(6, SENSOR_RANGE + 1, 5)
         for i in range(count):
             ray_angle = angle + (-spread + 2 * spread * i / (count - 1))
             dx, dy = math.cos(ray_angle), math.sin(ray_angle)
             distance = SENSOR_RANGE
-            for step in range(6, SENSOR_RANGE + 1, 5):
-                if not self.on_road(x + dx * step, y + dy * step):
+            for step in steps:
+                ix, iy = int(x + dx * step), int(y + dy * step)
+                if not (0 <= ix < width and 0 <= iy < height and get_at((ix, iy))):
                     distance = step
                     break
             values.append(distance / SENSOR_RANGE)
