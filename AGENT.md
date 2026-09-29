@@ -33,6 +33,7 @@ Tests set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`, so they run headl
 - There are 11 roads. Roads 1, 2, 10 and 11 keep their original layouts, and `test_race.py` asserts on geometry such as the start point and road widths. Update those tests deliberately when you change `ROAD_SPECS`.
 - Gauntlet (`Race`): the champion is always `cars[0]`. It needs `LAPS_PER_ROAD` (5) laps per road, `FINAL_ROAD_LAPS` (10) and a 60 s heat on road 11, then random roads; `tracks_completed` keeps counting. A champion crash or a challenger that beats it by `BEAT_MARGIN` resets to road 1 and 0. Always start on road 1.
 - The champion and runner-up are saved to `best_network.json` only when `tracks_completed` exceeds `saved_tracks`. Tests must never touch the real file: `test_race.py` patches `main.SAVE_PATH` to a temp directory in `setUp`.
+- `Car.score_on(track)` defines the score (constants `SCORE_*`). `Race.current_score` is the best score in the heat, `best_score_ever` the persisted record. Saving networks still needs a new `tracks_completed` record; a score record rewrites the file with the already-saved networks.
 - Sensor noise (`SENSOR_NOISE`) and start-heading jitter are deliberate anti-overfitting measures; set `Car.sensor_noise = 0` when a test needs deterministic sensors.
 - Switching roads restarts the heat but keeps the networks. **Apply & Restart** and `R` start a new population.
 - The UI palette constants (`BG`, `PANEL`, `TEXT`, `MUTED` and so on) are duplicated in `main.py` and `inspector.py`. Keep them in sync.

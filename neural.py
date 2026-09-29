@@ -131,11 +131,21 @@ def next_generation(
     return result
 
 
-def save_networks(path: Path, networks: list[Network], tracks_completed: int) -> None:
+@dataclass
+class SaveData:
+    networks: list[Network]
+    tracks_completed: int = 0
+    best_score: float = 0.0
+
+
+def save_networks(
+    path: Path, networks: list[Network], tracks_completed: int, best_score: float = 0.0
+) -> None:
     """Write the champions atomically so a crash never corrupts the file."""
     payload = {
         "version": SAVE_VERSION,
         "tracks_completed": tracks_completed,
+        "best_score": best_score,
         "networks": [network.to_dict() for network in networks],
     }
     path = Path(path)
@@ -144,8 +154,8 @@ def save_networks(path: Path, networks: list[Network], tracks_completed: int) ->
     temporary.replace(path)
 
 
-def load_networks(path: Path) -> tuple[list[Network], int] | None:
-    """Return (champions, tracks completed), or None if missing or unusable."""
+def load_networks(path: Path) -> SaveData | None:
+    """Return the saved champions and records, or None if missing or unusable."""
     try:
         payload = json.loads(Path(path).read_text())
         if payload["version"] != SAVE_VERSION:
@@ -153,6 +163,10 @@ def load_networks(path: Path) -> tuple[list[Network], int] | None:
         networks = [Network.from_dict(item) for item in payload["networks"]]
         if not networks or len({network.sizes for network in networks}) != 1:
             return None
-        return networks, max(0, int(payload["tracks_completed"]))
+        return SaveData(
+            networks,
+            max(0, int(payload["tracks_completed"])),
+            max(0.0, float(payload.get("best_score", 0.0))),
+        )
     except (OSError, ValueError, KeyError, TypeError):
         return None

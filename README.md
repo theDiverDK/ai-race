@@ -41,9 +41,13 @@ The counter resets to 0 and training restarts on Road 1 whenever the champion cr
 
 To avoid overfitting one road, sensor readings carry a little noise and cars start with a small random heading and offset.
 
+### Score
+
+Every car has a score: 100 points per lap driven (fractions count, so a crash keeps what it earned), plus up to 50 for pace once it has finished a lap (its fastest lap against top speed), all multiplied by `1 + 0.1 × (road − 1)` so later roads are worth more. The **Score** line shows the highest-scoring car in the current heat, and **Best score ever** the highest any car has reached.
+
 ### Saved network
 
-Each time the champion completes a road and sets a new record for tracks completed, the champion and runner-up are saved to `best_network.json` (git-ignored). On startup the app loads that file, adopts its network layout, and seeds the population from it (always beginning on Road 1); if the file is missing or unreadable it starts from scratch. **Restart Training** (`R`) always starts from scratch, and the file is only replaced once the new run beats the saved record.
+Each time the champion completes a road and sets a new record for tracks completed, the champion and runner-up are saved to `best_network.json` (git-ignored). The best score ever is stored in the same file, written when a heat ends with a new record and again on quit, and it is loaded on startup. On startup the app loads that file, adopts its network layout, and seeds the population from it (always beginning on Road 1); if the file is missing or unreadable it starts from scratch. **Restart Training** (`R`) always starts from scratch, and the file is only replaced once the new run beats the saved record.
 
 To run the checks:
 
