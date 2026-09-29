@@ -452,11 +452,24 @@ class Race:
 
     @property
     def run_score(self) -> float:
-        """The champion's points since it was crowned (or the best car's, before one exists)."""
+        """The champion's points since it was crowned.
+
+        Once the champion has crashed its run is over, so the score follows the
+        best car still racing, starting from zero. The same goes for the first
+        generation, before any champion exists.
+        """
         car = self.champion_car
-        if car is None:
-            return max(car.score_on(self.track) for car in self.cars)
-        return self.run_banked + car.score_on(self.track)
+        if car is not None and car.alive:
+            return self.run_banked + car.score_on(self.track)
+        return self.scoring_car.score_on(self.track)
+
+    @property
+    def scoring_car(self) -> Car:
+        """The car whose model the current run score belongs to."""
+        car = self.champion_car
+        if car is not None and car.alive:
+            return car
+        return self.leader or self.best_car
 
     def _beats(self, challenger: Car, champion: Car) -> bool:
         if challenger.fastest_lap is not None:
@@ -501,15 +514,10 @@ class Race:
         if self.current_score > self.best_score_ever:
             self.best_score_ever = self.current_score
             self.record_tracks = self.tracks_completed
-            champion_car = self.champion_car
-            self.record_brain = (champion_car or max(self.cars, key=lambda car: car.score_on(self.track))).brain
+            self.record_brain = self.scoring_car.brain
         goal = self.champion is not None and self.champion_laps >= self.laps_required
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
-        # A crashed champion has already lost the run, so its score can no longer
-        # change: end the heat now instead of racing on with a frozen score.
-        champion_car = self.champion_car
-        champion_crashed = champion_car is not None and not champion_car.alive
-        if goal or champion_crashed or time_expired or not any(car.alive for car in self.cars):
+        if goal or time_expired or not any(car.alive for car in self.cars):
             self._end_heat(goal)
 
     def _end_heat(self, goal: bool) -> None:

@@ -43,7 +43,7 @@ To avoid overfitting one road, sensor readings carry a little noise and cars sta
 
 ### Who won the last generation
 
-When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. A second line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). A champion crash ends the heat at once, since the run is already lost and its score cannot change.
+When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. A second line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). When the champion crashes the heat carries on until the time limit or the last car stops, and the score switches to the best car still racing, starting from zero, and the note appears when the heat ends.
 
 ### Score
 

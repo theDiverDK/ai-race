@@ -452,14 +452,28 @@ class RaceTests(unittest.TestCase):
         app.race.save_now()
         self.assertEqual(load_networks(self.save_path).networks[0].weights, champion.weights)
 
-    def test_champion_crash_ends_the_heat_immediately(self):
+    def test_champion_crash_keeps_the_race_going_and_score_follows_the_best_car(self):
         race = self.crowned_race()
+        with self.gauntlet(race, laps_per_heat=5):
+            race.update(0.01)  # road 1 done: banked points, now on road 2
         generation = race.generation
-        with self.gauntlet(race, crash=True):
-            race.update(0.01)  # far from the time limit, other cars still alive
+        self.assertGreater(race.run_banked, 0)
+
+        def champion_crashes_others_run(car, track, dt):
+            if car is race.cars[0]:
+                car.alive = False
+            elif car is race.cars[5]:
+                car.best_progress = track.length * 0.3
+        with patch.object(Car, "update", champion_crashes_others_run):
+            race.update(0.01)
+            self.assertEqual(race.generation, generation)  # the heat carries on
+            # 30% of a lap on road 2; the old run's banked points no longer count.
+            self.assertAlmostEqual(race.current_score, 30 * 1.1)
+            self.assertIs(race.scoring_car, race.cars[5])
+            self.finish_heat(race)
         self.assertEqual(race.generation, generation + 1)
-        self.assertEqual((race.track.level, race.run_banked), (1, 0))
         self.assertIn("crashed", race.last_result[1])
+        self.assertEqual((race.track.level, race.run_banked), (1, 0))
 
     def test_score_never_freezes_while_the_champion_races(self):
         race = self.crowned_race()
