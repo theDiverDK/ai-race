@@ -7,9 +7,13 @@ import random
 from dataclasses import dataclass
 
 
+WEIGHT_MUTATION_STD = 0.15
+BIAS_MUTATION_STD = 0.10
+
+
 @dataclass
 class Network:
-    """A fully connected network with tanh neurons and two driving outputs."""
+    """A fully connected network with tanh steering, drive, and brake outputs."""
 
     sizes: tuple[int, ...]
     weights: list[list[list[float]]]
@@ -25,12 +29,11 @@ class Network:
                 [[rng.gauss(0, scale) for _ in range(inputs)] for _ in range(outputs)]
             )
             biases.append([rng.gauss(0, 0.25) for _ in range(outputs)])
-        # A slight initial preference for forward motion makes the first
-        # generation useful to watch while still allowing braking to evolve.
+        # A slight initial preference for forward drive still permits reverse.
         biases[-1][1] += 0.35
         return cls(sizes, weights, biases)
 
-    def forward(self, inputs: list[float]) -> tuple[float, float]:
+    def forward(self, inputs: list[float]) -> tuple[float, float, float]:
         if len(inputs) != self.sizes[0]:
             raise ValueError(f"Expected {self.sizes[0]} inputs, got {len(inputs)}")
         values = inputs
@@ -39,7 +42,7 @@ class Network:
                 math.tanh(sum(weight * value for weight, value in zip(row, values)) + bias)
                 for row, bias in zip(weights, biases)
             ]
-        return values[0], values[1]
+        return values[0], values[1], values[2]
 
     def copy(self) -> "Network":
         return Network(
@@ -58,20 +61,20 @@ class Network:
                     if rng.random() < 0.5:
                         value = other.weights[layer_index][row_index][column_index]
                     if rng.random() < 0.12:
-                        value += rng.gauss(0, 0.35)
+                        value += rng.gauss(0, WEIGHT_MUTATION_STD)
                     row[column_index] = value
         for layer_index, layer in enumerate(child.biases):
             for index, value in enumerate(layer):
                 if rng.random() < 0.5:
                     value = other.biases[layer_index][index]
                 if rng.random() < 0.18:
-                    value += rng.gauss(0, 0.25)
+                    value += rng.gauss(0, BIAS_MUTATION_STD)
                 layer[index] = value
         return child
 
 
 def next_generation(
-    ranked: list[tuple[float, Network]], rng: random.Random, population: int
+    ranked: list[tuple[tuple[int, float, float], Network]], rng: random.Random, population: int
 ) -> list[Network]:
     """Keep champions, breed from strong drivers, and add some newcomers."""
     if not ranked or population < 4:

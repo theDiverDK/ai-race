@@ -1,6 +1,8 @@
 # Neural Circuit
 
-A Pygame race simulation where 50 cars learn to drive by evolving small neural networks. Each car sees the distance to the road edge through a fan of sensors. Its network produces two continuous controls: left/right steering and acceleration/braking.
+A Pygame race simulation where 50 cars learn to drive by evolving small neural networks. Each car sees the distance to the road edge through a fan of sensors. Its network produces three continuous controls: left/right steering, forward/reverse drive, and a separate brake.
+
+The drive output is signed: positive accelerates forward and negative accelerates in reverse. A positive brake output slows the car in either direction; zero or negative releases the brake. Reverse speed is capped below forward speed.
 
 ## Run
 
@@ -17,18 +19,21 @@ python main.py
 
 | Control | Action |
 | --- | --- |
-| Road arrows, or left/right arrow keys | Switch among ten roads. Roads 6–10 have sharper and more frequent bends. Switching restarts the current heat on the new road while keeping the networks. |
+| Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks. |
 | Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
 | **Limit On / Limit Off** | Turn the time limit on or off. With it off, the heat continues until every car has left the road or stalled. |
-| Input neurons, hidden layers, layer widths | Change the network design. Click **Apply & Restart** to start a new population with those settings. The output layer always has two neurons. |
+| Input neurons, hidden layers, layer widths | Change the network design. Click **Apply & Restart** to start a new population with those settings. The output layer always has three neurons. |
 | **Pause** / `P` | Pause or resume. |
-| **Speed** / `Tab` | Cycle through 1×, 2×, and 4× simulation speed. |
+| **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Starts at 4×. |
 | `V` | Show or hide the leading car's sensor rays. |
 | `R` | Restart training with the current settings. |
+| **View Network** | Open a live window for the highest scoring car in the current generation. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its current activation, bias, weighted input, and exact incoming and outgoing connection weights. Scroll the details pane for longer lists. |
 
 ## How learning works
 
-Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. Cars earn a score based mainly on their furthest forward progress along the road. At the end of a heat, the two best networks are kept, most new networks are bred and mutated from high-scoring cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
+Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. A car that completes a lap ranks above any car that has not; among finishers, the fastest lap wins. Until a car completes a lap, furthest forward progress determines the ranking. At the end of a heat, the two best networks are kept, most new networks are bred and mutated from high-ranking cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
+
+If at least one car finishes a full lap in each of five consecutive generations, the next generation starts on the next road with its evolved networks. A generation without a full lap resets the count. Road 11 is the final road; it does not wrap back to Road 1 automatically.
 
 To run the checks:
 

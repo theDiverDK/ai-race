@@ -7,7 +7,9 @@ import random
 from dataclasses import dataclass, field
 
 import pygame
+from pygame._sdl2.video import Window
 
+from inspector import NetworkInspector
 from neural import Network, next_generation
 
 
@@ -16,21 +18,24 @@ WIDTH = WORLD_W + PANEL_W
 FPS = 60
 POPULATION = 50
 DEFAULT_MAX_RUNTIME = 25
+DEFAULT_HIDDEN_WIDTH = 16
 SENSOR_RANGE = 175
+LAP_GENERATIONS_TO_ADVANCE = 5
 
-# Later circuits add tighter bends and narrower tarmac. The numbers are the
-# strengths of four waves applied to a closed, elliptical centerline.
+# Each new circuit combines different bends. Selected circuits narrow at the
+# listed angular positions; the first circuit keeps its original outline.
 ROAD_SPECS = [
-    ("Open Oval", 104, 0.000, 0.000, 0.000, 0.000, 0.0),
-    ("Long Sweep", 100, 0.035, 0.000, 0.000, 0.000, 0.4),
-    ("Rolling Ring", 96, 0.055, 0.012, 0.000, 0.000, 0.8),
-    ("Triple Bend", 92, 0.075, 0.025, 0.000, 0.000, 1.2),
-    ("S Curve", 88, 0.085, 0.040, 0.008, 0.000, 0.5),
-    ("Ripple Road", 84, 0.120, 0.080, 0.035, 0.020, 1.0),
-    ("Clover Run", 80, 0.140, 0.100, 0.045, 0.025, 1.5),
-    ("Switchback", 76, 0.150, 0.120, 0.055, 0.035, 0.3),
-    ("Tight Turns", 72, 0.170, 0.130, 0.065, 0.055, 0.8),
-    ("Expert Loop", 68, 0.180, 0.150, 0.075, 0.065, 1.3),
+    ("Open Oval", 104, (), (), 0.0),
+    ("Gentle Chicane", 100, ((3, .075, .2), (5, .045, 1.4)), (), 0.0),
+    ("Twin Esses", 96, ((4, .110, 1.1), (7, .055, .3)), (), 0.0),
+    ("Clover Bend", 92, ((3, .185, 2.2), (6, .065, .1)), (), 0.0),
+    ("Offset Slalom", 88, ((5, .165, .5), (2, .085, 1.8)), (), 0.0),
+    ("Pinch Point", 84, ((4, .140, 1.7), (7, .065, 2.6)), (.4, 3.4), .34),
+    ("Sawtooth Sweep", 80, ((6, .120, .4), (3, .100, 2.0)), (2.1,), .38),
+    ("Serpentine", 76, ((5, .155, 1.9), (8, .070, .8)), (1.0, 4.1), .40),
+    ("Narrow Gates", 72, ((7, .140, 1.2), (4, .090, 2.8)), (.6, 2.8, 5.0), .44),
+    ("Switchback Circuit", 68, ((9, .075, .7), (5, .105, 2.3)), (1.5, 3.7, 5.6), .46),
+    ("Hairpin Ladder", 58, (), (), 0.0),
 ]
 
 BG = (13, 31, 35)
@@ -74,12 +79,32 @@ def draw_band(surface: pygame.Surface, points: list[tuple[float, float]], color,
         pygame.draw.circle(surface, color, (round(x), round(y)), radius)
 
 
+def draw_road_band(
+    surface: pygame.Surface, points: list[tuple[float, float]],
+    widths: list[int], color, padding: int = 0,
+) -> None:
+    """Paint a road whose width can change along its centerline."""
+    for (x, y), width in zip(points, widths):
+        pygame.draw.circle(surface, color, (round(x), round(y)), (width + padding) // 2)
+
+
+def pinched_width(width: int, theta: float, centers: tuple[float, ...], depth: float) -> int:
+    """Cosine-shaped bottlenecks blend smoothly into the normal road width."""
+    half_span = .34
+    reduction = 0.0
+    for center in centers:
+        distance = abs((theta - center + math.pi) % (2 * math.pi) - math.pi)
+        if distance < half_span:
+            reduction = max(reduction, depth * (1 + math.cos(math.pi * distance / half_span)) / 2)
+    return round(width * (1 - reduction))
+
+
 class Track:
     def __init__(self, level: int = 1) -> None:
         if not 1 <= level <= len(ROAD_SPECS):
-            raise ValueError("Road number must be between 1 and 10")
+            raise ValueError(f"Road number must be between 1 and {len(ROAD_SPECS)}")
         self.level = level
-        self.name, self.road_width, a3, a5, a7, a9, phase = ROAD_SPECS[level - 1]
+        self.name, self.road_width, waves, pinch_centers, pinch_depth = ROAD_SPECS[level - 1]
         if level == 1:
             controls = [
                 (215, 155), (430, 112), (665, 155), (775, 265),
@@ -87,22 +112,40 @@ class Track:
                 (127, 535), (120, 345),
             ]
             self.points = catmull_rom(controls)
+            self.widths = [self.road_width] * len(self.points)
+        elif level == 11:
+            # Six long vertical legs, five alternating U-turns, and a low
+            # return straight that closes the circuit without crossing it.
+            controls = [
+                (130, 610), (130, 400), (130, 200),
+                (145, 135), (185, 105), (225, 135), (240, 200),
+                (240, 400), (240, 530),
+                (255, 595), (295, 625), (335, 595), (350, 530),
+                (350, 400), (350, 200),
+                (365, 135), (405, 105), (445, 135), (460, 200),
+                (460, 400), (460, 530),
+                (475, 595), (515, 625), (555, 595), (570, 530),
+                (570, 400), (570, 200),
+                (585, 135), (625, 105), (665, 135), (680, 200),
+                (680, 400), (680, 610), (695, 690), (660, 735),
+                (520, 735), (350, 735), (180, 735), (130, 690),
+            ]
+            self.points = catmull_rom(controls)
+            self.widths = [self.road_width] * len(self.points)
         else:
             self.points = []
-            radius_x, radius_y = (260, 220) if level >= 6 else (300, 248)
-            for i in range(240):
-                theta = -2.25 + 2 * math.pi * i / 240
-                radius = (
-                    1
-                    + a3 * math.sin(3 * theta + phase)
-                    + a5 * math.sin(5 * theta - 0.7 * phase)
-                    + a7 * math.cos(7 * theta + 1.3 * phase)
-                    + a9 * math.sin(9 * theta - 0.4 * phase)
+            self.widths = []
+            for i in range(320):
+                theta = -2.25 + 2 * math.pi * i / 320
+                radius = 1 + sum(
+                    amplitude * math.sin(frequency * theta + phase)
+                    for frequency, amplitude, phase in waves
                 )
                 self.points.append(
-                    (450 + radius_x * radius * math.cos(theta),
-                     400 + radius_y * radius * math.sin(theta))
+                    (450 + 260 * radius * math.cos(theta),
+                     400 + 215 * radius * math.sin(theta))
                 )
+                self.widths.append(pinched_width(self.road_width, theta, pinch_centers, pinch_depth))
         self.count = len(self.points)
         self.lengths = []
         self.cumulative = [0.0]
@@ -114,7 +157,7 @@ class Track:
         self.length = self.cumulative[-1]
 
         road_alpha = pygame.Surface((WORLD_W, HEIGHT), pygame.SRCALPHA)
-        draw_band(road_alpha, self.points, (255, 255, 255), self.road_width)
+        draw_road_band(road_alpha, self.points, self.widths, (255, 255, 255))
         self.mask = pygame.mask.from_surface(road_alpha)
         self.art = self._make_art()
 
@@ -170,9 +213,9 @@ class Track:
                 radius = rng.randrange(2, 7)
                 pygame.draw.circle(art, rng.choice([(23, 54, 49), (27, 60, 52), (18, 47, 43)]), (x, y), radius)
 
-        draw_band(art, self.points, (7, 15, 22), self.road_width + 16)
-        draw_band(art, self.points, (173, 191, 188), self.road_width + 8)
-        draw_band(art, self.points, (49, 62, 69), self.road_width)
+        draw_road_band(art, self.points, self.widths, (7, 15, 22), 16)
+        draw_road_band(art, self.points, self.widths, (173, 191, 188), 8)
+        draw_road_band(art, self.points, self.widths, (49, 62, 69))
         for i in range(0, self.count, 5):
             p1 = self.points[i]
             p2 = self.points[(i + 2) % self.count]
@@ -184,8 +227,8 @@ class Track:
         angle = math.atan2(ny - y, nx - x)
         px, py = -math.sin(angle), math.cos(angle)
         for cell in range(-6, 6):
-            start = cell * self.road_width / 12
-            end = (cell + 1) * self.road_width / 12
+            start = cell * self.widths[0] / 12
+            end = (cell + 1) * self.widths[0] / 12
             color = (240, 246, 237) if cell % 2 == 0 else (33, 42, 47)
             pygame.draw.line(
                 art, color,
@@ -204,40 +247,66 @@ class Car:
     speed: float = 45.0
     alive: bool = True
     time: float = 0.0
+    distance_travelled: float = 0.0
     progress: float = 0.0
     best_progress: float = 0.0
+    laps_completed: int = 0
+    fastest_lap: float | None = None
+    last_lap_crossing_time: float = 0.0
     nearest: int = 0
     sensors: list[float] = field(default_factory=list)
     steering: float = 0.0
     drive: float = 0.0
+    brake: float = 0.0
 
     @property
-    def fitness(self) -> float:
-        return self.best_progress + min(self.time, 10) * 0.05
+    def rank_key(self) -> tuple[int, float, float]:
+        if self.fastest_lap is not None:
+            return 1, -self.fastest_lap, self.best_progress
+        return 0, self.best_progress, min(self.time, 10) * 0.05
 
     def update(self, track: Track, dt: float) -> None:
         if not self.alive:
             return
         self.time += dt
         self.sensors = track.sense(self.x, self.y, self.angle, self.brain.sizes[0])
-        self.steering, self.drive = self.brain.forward(self.sensors)
-        acceleration = 200 * max(0.0, self.drive) - 290 * max(0.0, -self.drive)
-        self.speed = max(0.0, min(220.0, self.speed + (acceleration - 25 - 0.07 * self.speed) * dt))
-        self.angle += self.steering * (1.25 + 0.005 * self.speed) * dt
+        self.steering, self.drive, self.brake = self.brain.forward(self.sensors)
+        # Drive is signed: negative accelerates backwards. Brake always acts
+        # against the current motion and cannot reverse the car by itself.
+        self.speed += 200 * self.drive * dt
+        drag = (25 + 0.07 * abs(self.speed)) * dt
+        braking = 290 * max(0.0, self.brake) * dt
+        if self.speed > 0:
+            self.speed = max(0.0, self.speed - drag - braking)
+        elif self.speed < 0:
+            self.speed = min(0.0, self.speed + drag + braking)
+        self.speed = max(-110.0, min(220.0, self.speed))
+        self.distance_travelled += abs(self.speed) * dt
+        turn_direction = -1 if self.speed < 0 else 1
+        self.angle += self.steering * (1.25 + 0.005 * abs(self.speed)) * turn_direction * dt
         self.x += math.cos(self.angle) * self.speed * dt
         self.y += math.sin(self.angle) * self.speed * dt
         if not track.on_road(self.x, self.y):
             self.alive = False
             return
         position, self.nearest = track.progress(self.x, self.y, self.nearest)
+        previous_progress = self.progress
         current = self.progress % track.length
         delta = (position - current + track.length / 2) % track.length - track.length / 2
         if -15 < delta < 15:
             self.progress += delta
+        while self.progress >= (self.laps_completed + 1) * track.length:
+            finish_distance = (self.laps_completed + 1) * track.length
+            finish_fraction = (finish_distance - previous_progress) / (self.progress - previous_progress)
+            finish_time = self.time - dt + finish_fraction * dt
+            lap_time = finish_time - self.last_lap_crossing_time
+            self.fastest_lap = lap_time if self.fastest_lap is None else min(self.fastest_lap, lap_time)
+            self.last_lap_crossing_time = finish_time
+            self.laps_completed += 1
         self.best_progress = max(self.best_progress, self.progress)
-        if self.time > 4.0 and self.best_progress < 10:
+        if self.time > 4.0 and self.distance_travelled < 10:
             self.alive = False
-        if self.time > 8.0 and self.speed < 3:
+        if self.time > 8.0 and abs(self.speed) < 3:
             self.alive = False
 
 
@@ -252,10 +321,12 @@ class Race:
         self.hidden = hidden[:]
         self.max_runtime = max_runtime
         self.time_limit_enabled = time_limit_enabled
-        self.sizes = (inputs, *hidden, 2)
+        self.sizes = (inputs, *hidden, 3)
         self.generation = 1
+        self.lap_streak = 0
         self.elapsed = 0.0
         self.best_ever = 0.0
+        self.fastest_ever: float | None = None
         self.history: list[float] = []
         self.cars: list[Car] = []
         self._spawn([Network.random(self.sizes, self.rng) for _ in range(POPULATION)])
@@ -277,7 +348,9 @@ class Race:
         """Re-run this generation on another circuit, keeping its networks."""
         self.track = track
         self.best_ever = 0.0
+        self.fastest_ever = None
         self.history.clear()
+        self.lap_streak = 0
         self._spawn([car.brain for car in self.cars])
 
     def update(self, dt: float) -> None:
@@ -285,18 +358,37 @@ class Race:
         for car in self.cars:
             car.update(self.track, dt)
         self.best_ever = max(self.best_ever, *(car.best_progress for car in self.cars))
+        for car in self.cars:
+            if car.fastest_lap is not None:
+                self.fastest_ever = (
+                    car.fastest_lap if self.fastest_ever is None
+                    else min(self.fastest_ever, car.fastest_lap)
+                )
         time_expired = self.time_limit_enabled and self.elapsed >= self.max_runtime
         if time_expired or not any(car.alive for car in self.cars):
-            ranked = [(car.fitness, car.brain) for car in self.cars]
-            self.history.append(max(score for score, _ in ranked))
+            ranked = [(car.rank_key, car.brain) for car in self.cars]
+            self.history.append(max(car.best_progress for car in self.cars))
             self.history = self.history[-40:]
-            self._spawn(next_generation(ranked, self.rng, POPULATION))
+            completed_lap = any(car.fastest_lap is not None for car in self.cars)
+            self.lap_streak = min(LAP_GENERATIONS_TO_ADVANCE, self.lap_streak + 1) if completed_lap else 0
+            brains = next_generation(ranked, self.rng, POPULATION)
+            if self.lap_streak == LAP_GENERATIONS_TO_ADVANCE and self.track.level < len(ROAD_SPECS):
+                self.track = Track(self.track.level + 1)
+                self.best_ever = 0.0
+                self.fastest_ever = None
+                self.history.clear()
+                self.lap_streak = 0
+            self._spawn(brains)
             self.generation += 1
 
     @property
     def leader(self) -> Car | None:
         living = [car for car in self.cars if car.alive]
-        return max(living, key=lambda car: car.best_progress) if living else None
+        return max(living, key=lambda car: car.rank_key) if living else None
+
+    @property
+    def best_car(self) -> Car:
+        return max(self.cars, key=lambda car: car.rank_key)
 
 
 class App:
@@ -304,6 +396,8 @@ class App:
         pygame.init()
         pygame.display.set_caption("Neural Circuit")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.main_window = Window.from_display_module()
+        self.main_window_id = self.main_window.id
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Avenir Next", 17)
         self.small = pygame.font.SysFont("Avenir Next", 14)
@@ -313,14 +407,15 @@ class App:
         self.road_level = 1
         self.track = Track(self.road_level)
         self.inputs = 7
-        self.hidden = [12, 12]
+        self.hidden = [DEFAULT_HIDDEN_WIDTH, DEFAULT_HIDDEN_WIDTH]
         self.max_runtime = DEFAULT_MAX_RUNTIME
         self.time_limit_enabled = True
         self.race = Race(self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled)
         self.paused = False
-        self.speed = 1
+        self.speed = 4
         self.show_sensors = True
         self.buttons: list[tuple[pygame.Rect, str]] = []
+        self.inspector: NetworkInspector | None = None
 
     def label(self, text: str, x: int, y: int, color=TEXT, font=None) -> None:
         self.screen.blit((font or self.font).render(text, True, color), (x, y))
@@ -348,13 +443,18 @@ class App:
         if action == "pause":
             self.paused = not self.paused
         elif action == "speed":
-            self.speed = {1: 2, 2: 4, 4: 1}[self.speed]
+            self.speed = {1: 2, 2: 4, 4: 8, 8: 1}[self.speed]
         elif action == "limit":
             self.time_limit_enabled = not self.time_limit_enabled
             self.race.time_limit_enabled = self.time_limit_enabled
         elif action == "apply":
             self.race = Race(self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled)
             self.paused = False
+        elif action == "inspect":
+            if self.inspector is None:
+                self.inspector = NetworkInspector()
+            else:
+                self.inspector.window.focus()
         else:
             key, sign = action.split(":")
             change = 1 if sign == "+" else -1
@@ -370,7 +470,7 @@ class App:
             elif key == "layers":
                 new_count = max(1, min(5, len(self.hidden) + change))
                 while len(self.hidden) < new_count:
-                    self.hidden.append(12)
+                    self.hidden.append(DEFAULT_HIDDEN_WIDTH)
                 self.hidden = self.hidden[:new_count]
             elif key.startswith("hidden"):
                 index = int(key[6:])
@@ -432,9 +532,14 @@ class App:
 
         alive = sum(car.alive for car in self.race.cars)
         self.label("GENERATION", x + 23, 162, MUTED, self.tiny)
-        self.label("BEST ON THIS ROAD", x + 184, 162, MUTED, self.tiny)
+        best_label = "FASTEST LAP" if self.race.fastest_ever is not None else "BEST DISTANCE"
+        self.label(best_label, x + 184, 162, MUTED, self.tiny)
         self.label(str(self.race.generation), x + 23, 178, TEXT, self.bold)
-        self.label(f"{self.race.best_ever / 10:.0f} m", x + 184, 178, TEXT, self.bold)
+        best_value = (
+            f"{self.race.fastest_ever:.2f} s" if self.race.fastest_ever is not None
+            else f"{self.race.best_ever / 10:.0f} m"
+        )
+        self.label(best_value, x + 184, 178, TEXT, self.bold)
         self.label("CARS RUNNING", x + 23, 215, MUTED, self.tiny)
         self.label("LAPS", x + 184, 215, MUTED, self.tiny)
         self.label(f"{alive} / {POPULATION}", x + 23, 231, TEXT, self.font)
@@ -444,10 +549,15 @@ class App:
         self.label("ROAD & RACE", x + 23, 274, ACCENT, self.small)
         self.button(pygame.Rect(x + 22, 301, 38, 32), "‹", "road:-")
         self.button(pygame.Rect(x + 300, 301, 38, 32), "›", "road:+")
-        road_number = self.bold.render(f"ROAD {self.road_level:02d} / 10", True, TEXT)
+        road_number = self.bold.render(f"ROAD {self.road_level:02d} / {len(ROAD_SPECS)}", True, TEXT)
         self.screen.blit(road_number, road_number.get_rect(center=(x + 180, 317)))
         road_name = self.small.render(self.track.name, True, MUTED)
         self.screen.blit(road_name, road_name.get_rect(center=(x + 180, 345)))
+        auto_text = (
+            f"Auto next road: {self.race.lap_streak}/{LAP_GENERATIONS_TO_ADVANCE} lap generations"
+            if self.road_level < len(ROAD_SPECS) else "Final road"
+        )
+        self.label(auto_text, x + 23, 357, MUTED, self.tiny)
         self.stepper(374, "Max runtime (seconds)", self.max_runtime, "runtime")
         self.button(
             pygame.Rect(x + 22, 407, 133, 27),
@@ -469,10 +579,11 @@ class App:
             self.stepper(563 + i * 29, f"Layer {i + 1}", size, f"hidden{i}")
 
         self.label("OUTPUTS", x + 23, 711, MUTED, self.tiny)
-        self.label("steer: left / right    •    drive: speed / brake", x + 23, 727, TEXT, self.small)
+        self.label("steer: L/R  •  drive: F/R  •  brake: slow/stop", x + 23, 727, TEXT, self.small)
         dirty = self.inputs != self.race.inputs or self.hidden != self.race.hidden
+        self.button(pygame.Rect(x + 22, 755, 153, 38), "VIEW NETWORK", "inspect")
         self.button(
-            pygame.Rect(x + 22, 755, PANEL_W - 44, 38),
+            pygame.Rect(x + 184, 755, 154, 38),
             "APPLY & RESTART" if dirty else "RESTART TRAINING", "apply", primary=True,
         )
 
@@ -480,9 +591,19 @@ class App:
         running = True
         while running:
             for event in pygame.event.get():
+                window = getattr(event, "window", None)
+                window_id = getattr(window, "id", window)
                 if event.type == pygame.QUIT:
                     running = False
+                elif self.inspector and window_id == self.inspector.window.id:
+                    if not self.inspector.handle_event(event):
+                        self.inspector.close()
+                        self.inspector = None
+                elif event.type == pygame.WINDOWCLOSE and window_id == self.main_window_id:
+                    running = False
                 elif event.type == pygame.KEYDOWN:
+                    if window_id not in (None, self.main_window_id):
+                        continue
                     if event.key == pygame.K_p:
                         self.handle_action("pause")
                     elif event.key == pygame.K_r:
@@ -496,6 +617,8 @@ class App:
                     elif event.key == pygame.K_RIGHT:
                         self.handle_action("road:+")
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if window_id not in (None, self.main_window_id):
+                        continue
                     for rect, action in self.buttons:
                         if rect.collidepoint(event.pos):
                             self.handle_action(action)
@@ -504,10 +627,17 @@ class App:
             if not self.paused:
                 for _ in range(self.speed):
                     self.race.update(1 / FPS)
+                if self.track is not self.race.track:
+                    self.track = self.race.track
+                    self.road_level = self.track.level
             self.draw_world()
             self.draw_panel()
             pygame.display.flip()
+            if self.inspector:
+                self.inspector.draw(self.race, self.paused)
             self.clock.tick(FPS)
+        if self.inspector:
+            self.inspector.close()
         pygame.quit()
 
 
