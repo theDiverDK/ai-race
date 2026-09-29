@@ -27,8 +27,9 @@ FINAL_ROAD_RUNTIME = 60
 # A challenger must be this much faster (or finish when the champion has not)
 # before it takes the title, so a near-identical clone cannot reset progress.
 BEAT_MARGIN = 0.03
-# Score: points per lap driven (fractions count), plus a pace bonus once a lap
-# is finished. Later roads are worth more so scores compare across roads.
+# Score: each finished lap earns lap points plus a pace bonus, and the lap in
+# progress earns a fraction. Later roads are worth more. A champion's run score
+# adds this up across roads, so a higher score means a better model.
 SCORE_LAP_POINTS = 100
 SCORE_PACE_POINTS = 50
 SCORE_ROAD_BONUS = 0.10
@@ -267,6 +268,7 @@ class Car:
     best_progress: float = 0.0
     laps_completed: int = 0
     fastest_lap: float | None = None
+    lap_times: list[float] = field(default_factory=list)
     last_lap_crossing_time: float = 0.0
     nearest: int = 0
     sensors: list[float] = field(default_factory=list)
@@ -281,14 +283,17 @@ class Car:
             return 1, -self.fastest_lap, self.best_progress
         return 0, self.best_progress, min(self.time, 10) * 0.05
 
+    def lap_score(self, track: Track) -> float:
+        """Points for finished laps only: lap points plus a pace bonus per lap."""
+        ideal = track.length / TOP_SPEED
+        laps = sum(SCORE_LAP_POINTS + SCORE_PACE_POINTS * min(1.0, ideal / t) for t in self.lap_times)
+        return laps * (1 + SCORE_ROAD_BONUS * (track.level - 1))
+
     def score_on(self, track: Track) -> float:
-        """Distance in laps plus a pace bonus, weighted by road difficulty."""
+        """Finished laps plus the fraction of the current lap driven so far."""
+        partial = max(0.0, self.best_progress / track.length - self.laps_completed)
         weight = 1 + SCORE_ROAD_BONUS * (track.level - 1)
-        score = SCORE_LAP_POINTS * self.best_progress / track.length
-        if self.fastest_lap:
-            efficiency = min(1.0, track.length / TOP_SPEED / self.fastest_lap)
-            score += SCORE_PACE_POINTS * efficiency
-        return score * weight
+        return self.lap_score(track) + SCORE_LAP_POINTS * min(partial, 1.0) * weight
 
     def update(self, track: Track, dt: float) -> None:
         if not self.alive:
@@ -332,6 +337,7 @@ class Car:
             finish_time = self.time - dt + finish_fraction * dt
             lap_time = finish_time - self.last_lap_crossing_time
             self.fastest_lap = lap_time if self.fastest_lap is None else min(self.fastest_lap, lap_time)
+            self.lap_times.append(lap_time)
             self.last_lap_crossing_time = finish_time
             self.laps_completed += 1
         self.best_progress = max(self.best_progress, self.progress)
@@ -352,9 +358,9 @@ class Race:
     def __init__(
         self, track: Track, inputs: int, hidden: list[int],
         max_runtime: int = DEFAULT_MAX_RUNTIME, time_limit_enabled: bool = True,
-        seed_networks: list[Network] | None = None, saved_tracks: int = 0,
+        seed_networks: list[Network] | None = None, record_tracks: int = 0,
         save_path: Path | None = None, best_score: float = 0.0,
-        saved_networks: list[Network] | None = None,
+        record_brain: Network | None = None,
     ) -> None:
         self.track = track
         self.rng = random.Random()
@@ -373,12 +379,14 @@ class Race:
         self.tracks_completed = 0
         self.laps_banked = 0  # champion laps finished on this road in earlier heats
         self.random_phase = False
-        self.saved_tracks = saved_tracks
         self.save_path = save_path
-        self.saved_networks = saved_networks if saved_networks is not None else list(seed_networks or [])
-        self.current_score = 0.0  # best car's score in this heat
+        self.run_banked = 0.0  # points from finished laps in the champion's earlier heats
+        self.current_score = 0.0  # the champion's run score
+        # The record is tied to the model that set it, so higher means a better saved model.
         self.best_score_ever = best_score
         self.saved_best_score = best_score
+        self.record_tracks = record_tracks
+        self.record_brain = record_brain or (seed_networks[0] if seed_networks else None)
         self._tracks = {track.level: track}
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
@@ -401,7 +409,6 @@ class Race:
             for brain in brains
         ]
         self.elapsed = 0.0
-        self.current_score = 0.0
 
     def track_for(self, level: int) -> Track:
         if level not in self._tracks:
@@ -430,7 +437,16 @@ class Race:
     def _reset_gauntlet(self) -> None:
         self.tracks_completed = 0
         self.laps_banked = 0
+        self.run_banked = 0.0
         self.random_phase = False
+
+    @property
+    def run_score(self) -> float:
+        """The champion's points since it was crowned (or the best car's, before one exists)."""
+        car = self.champion_car
+        if car is None:
+            return max(car.score_on(self.track) for car in self.cars)
+        return self.run_banked + car.score_on(self.track)
 
     def _beats(self, challenger: Car, champion: Car) -> bool:
         if challenger.fastest_lap is not None:
@@ -439,23 +455,15 @@ class Race:
             return False
         return challenger.best_progress > champion.best_progress * (1 + BEAT_MARGIN)
 
-    def _persist(self, networks: list[Network] | None = None) -> None:
-        """Write the saved champions with the current records."""
-        if networks is not None:
-            self.saved_networks = networks
-        if not self.save_path or not self.saved_networks:
+    def save_now(self) -> None:
+        """Write the record-setting model and score if the record is not saved yet."""
+        if not self.save_path or self.record_brain is None or self.best_score_ever <= self.saved_best_score:
             return
         try:
-            save_networks(self.save_path, self.saved_networks, self.saved_tracks, self.best_score_ever)
+            save_networks(self.save_path, [self.record_brain], self.record_tracks, self.best_score_ever)
         except OSError:
             return
         self.saved_best_score = self.best_score_ever
-
-    def save_now(self) -> None:
-        """Flush a score record that has not been written yet (used on quit)."""
-        if self.best_score_ever > self.saved_best_score:
-            best = max(self.cars, key=lambda car: car.score_on(self.track))
-            self._persist(self.saved_networks or [best.brain])
 
     def change_track(self, track: Track) -> None:
         """Jump to another road: the heat restarts and the gauntlet begins there."""
@@ -478,8 +486,12 @@ class Race:
                     car.fastest_lap if self.fastest_ever is None
                     else min(self.fastest_ever, car.fastest_lap)
                 )
-        self.current_score = max(car.score_on(self.track) for car in self.cars)
-        self.best_score_ever = max(self.best_score_ever, self.current_score)
+        self.current_score = self.run_score
+        if self.current_score > self.best_score_ever:
+            self.best_score_ever = self.current_score
+            self.record_tracks = self.tracks_completed
+            champion_car = self.champion_car
+            self.record_brain = (champion_car or max(self.cars, key=lambda car: car.score_on(self.track))).brain
         goal = self.champion is not None and self.champion_laps >= self.laps_required
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
         if goal or time_expired or not any(car.alive for car in self.cars):
@@ -506,12 +518,10 @@ class Race:
             else:
                 brains[0] = self.champion  # the champion always survives unchanged
                 next_level = self.track.level
+                self.run_banked += champion_car.lap_score(self.track)
                 if goal:
                     self.tracks_completed += 1
                     self.laps_banked = 0
-                    if self.tracks_completed > self.saved_tracks:
-                        self.saved_tracks = self.tracks_completed
-                        self._persist([self.champion, brains[1]])
                     if self.random_phase or self.track.level == len(ROAD_SPECS):
                         self.random_phase = True
                         next_level = self.rng.randint(1, len(ROAD_SPECS))
@@ -557,15 +567,15 @@ class App:
         self.time_limit_enabled = True
         # Resume from the saved champions when possible, otherwise start from scratch.
         saved = load_networks(self.save_path)
-        seed, saved_tracks, best_score = None, 0, 0.0
+        seed, record_tracks, best_score = None, 0, 0.0
         if saved:
-            seed, saved_tracks, best_score = saved.networks, saved.tracks_completed, saved.best_score
+            seed, record_tracks, best_score = saved.networks, saved.tracks_completed, saved.best_score
             self.inputs, self.hidden = seed[0].sizes[0], list(seed[0].sizes[1:-1])
         self.road_level = 1  # the gauntlet always starts on road 1
         self.track = Track(self.road_level)
         self.race = Race(
             self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
-            seed, saved_tracks, self.save_path, best_score,
+            seed, record_tracks, self.save_path, best_score,
         )
         self.paused = False
         self.speed = 4
@@ -609,8 +619,8 @@ class App:
             self.track = Track(self.road_level)
             self.race = Race(
                 self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
-                saved_tracks=self.race.saved_tracks, save_path=self.save_path,
-                best_score=self.race.best_score_ever, saved_networks=self.race.saved_networks,
+                record_tracks=self.race.record_tracks, save_path=self.save_path,
+                best_score=self.race.best_score_ever, record_brain=self.race.record_brain,
             )
             self.paused = False
         elif action == "inspect":
@@ -673,8 +683,12 @@ class App:
         self.label(f"Tracks completed: {self.race.tracks_completed}", 37, 108, ACCENT, self.font)
         lap_text = f"Lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
         self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), 38, 133, MUTED, self.small)
-        self.label(f"Score: {self.race.current_score:,.0f}", 37, 160, ORANGE, self.font)
-        self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", 38, 186, MUTED, self.small)
+        at_record = self.race.current_score >= self.race.best_score_ever > 0
+        self.label(f"Run score: {self.race.current_score:,.0f}", 37, 160, ACCENT if at_record else ORANGE, self.font)
+        self.label(
+            f"Best score ever: {self.race.best_score_ever:,.0f}" + ("  NEW RECORD" if at_record else ""),
+            38, 186, ACCENT if at_record else MUTED, self.small,
+        )
 
         pygame.draw.rect(self.screen, (11, 22, 30), (22, HEIGHT - 58, 580, 37), border_radius=8)
         self.label("P  pause     R  restart     V  sensors     TAB  speed     ARROWS  road", 36, HEIGHT - 49, MUTED, self.small)

@@ -265,6 +265,7 @@ class RaceTests(unittest.TestCase):
                     car.laps_completed = laps_per_heat
                     car.best_progress = track.length * laps_per_heat
                     car.fastest_lap = 5.0
+                    car.lap_times = [track.length / 220 * 2] * laps_per_heat  # half of top pace
         return patch.object(Car, "update", fake_update)
 
     def finish_heat(self, race):
@@ -373,40 +374,49 @@ class RaceTests(unittest.TestCase):
         race.change_track(Track(3))
         self.assertEqual((race.track.level, race.tracks_completed, race.laps_banked), (3, 0, 0))
 
-    def test_save_only_for_a_new_record_and_load_round_trip(self):
-        race = self.crowned_race(save_path=self.save_path)
-        self.assertFalse(self.save_path.exists())
-        with self.gauntlet(race, laps_per_heat=5):
-            race.update(0.01)
-        saved = load_networks(self.save_path)
-        self.assertEqual((len(saved.networks), saved.tracks_completed), (2, 1))
-        self.assertEqual(saved.networks[0].weights, race.champion.weights)
-        # A crashed, restarted run below the record leaves the file alone.
-        with self.gauntlet(race, crash=True):
-            self.finish_heat(race)
-        with self.gauntlet(race, laps_per_heat=5):
-            race.update(0.01)
-        self.assertEqual(load_networks(self.save_path).tracks_completed, 1)
-
-    def test_score_rewards_distance_pace_and_harder_roads(self):
+    def test_score_counts_laps_pace_partial_lap_and_road_weight(self):
         track1, track5 = Track(1), Track(5)
         car = Car(Network.random((7, 8, 3), random.Random(1)), 0, 0, 0)
         self.assertEqual(car.score_on(track1), 0)
         car.best_progress = track1.length / 2
-        half = car.score_on(track1)
-        self.assertAlmostEqual(half, 50)
-        car.best_progress = track1.length
-        full = car.score_on(track1)
-        self.assertAlmostEqual(full, 100)
-        car.fastest_lap = track1.length / 220 * 2  # half of top pace
-        self.assertAlmostEqual(car.score_on(track1), 100 + 25)
-        car.fastest_lap = track1.length / 220  # top pace
-        self.assertAlmostEqual(car.score_on(track1), 150)
-        car.best_progress = track5.length
-        car.fastest_lap = None
-        self.assertAlmostEqual(car.score_on(track5), 100 * 1.4)
+        self.assertAlmostEqual(car.score_on(track1), 50)
+        car.best_progress = track1.length * 1.5
+        car.laps_completed, car.lap_times = 1, [track1.length / 220 * 2]  # half of top pace
+        self.assertAlmostEqual(car.lap_score(track1), 100 + 25)
+        self.assertAlmostEqual(car.score_on(track1), 125 + 50)
+        car.lap_times = [track1.length / 220]  # top pace
+        self.assertAlmostEqual(car.lap_score(track1), 150)
+        car.best_progress, car.laps_completed = track5.length, 1
+        car.lap_times = [track5.length / 220]
+        self.assertAlmostEqual(car.lap_score(track5), 150 * 1.4)
 
-    def test_race_tracks_current_and_best_score(self):
+    def test_run_score_accumulates_across_roads_and_resets_on_crash(self):
+        race = self.crowned_race()
+        with self.gauntlet(race, laps_per_heat=5):
+            race.update(0.01)  # road 1 finished: 5 * (100 + 25)
+        self.assertAlmostEqual(race.run_banked, 625)
+        self.assertEqual(race.track.level, 2)
+        with self.gauntlet(race, laps_per_heat=5):
+            race.update(0.01)  # road 2 is worth 10% more
+        self.assertAlmostEqual(race.run_banked, 625 + 625 * 1.1)
+        self.assertAlmostEqual(race.best_score_ever, 625 + 625 * 1.1)
+        with self.gauntlet(race, crash=True):
+            self.finish_heat(race)
+        self.assertEqual(race.run_banked, 0)
+        self.assertAlmostEqual(race.best_score_ever, 625 + 625 * 1.1)  # the record survives
+
+    def test_live_run_score_includes_the_lap_in_progress(self):
+        race = self.crowned_race()
+
+        def half_lap(car, track, dt):
+            if car is race.cars[0]:
+                car.best_progress = track.length / 2
+        with patch.object(Car, "update", half_lap):
+            race.update(0.01)
+        self.assertAlmostEqual(race.current_score, 50)
+        self.assertAlmostEqual(race.best_score_ever, 50)
+
+    def test_score_before_any_champion_uses_the_best_car(self):
         race = Race(Track(1), 7, [8], max_runtime=5)
 
         def score_by_slot(car, track, dt):
@@ -414,35 +424,33 @@ class RaceTests(unittest.TestCase):
         with patch.object(Car, "update", score_by_slot):
             race.update(1)
         self.assertAlmostEqual(race.current_score, 49)
-        self.assertAlmostEqual(race.best_score_ever, 49)
+
+    def test_record_saves_the_model_that_set_it_and_is_loaded_back(self):
+        race = self.crowned_race(save_path=self.save_path)
+        champion = race.champion
+        self.assertFalse(self.save_path.exists())
+        with self.gauntlet(race, laps_per_heat=5):
+            race.update(0.01)
+            self.finish_heat(race)
+        saved = load_networks(self.save_path)
+        self.assertAlmostEqual(saved.best_score, race.best_score_ever)
+        self.assertEqual(saved.networks[0].weights, champion.weights)
+        # A worse later run leaves the saved model and score alone.
+        with self.gauntlet(race, crash=True):
+            self.finish_heat(race)
         with patch.object(Car, "update", return_value=None):
-            race.elapsed = race.heat_limit
-            race.update(0)  # new heat: current resets, record stays
-        self.assertEqual(race.current_score, 0)
-        self.assertAlmostEqual(race.best_score_ever, 49)
-
-    def test_best_score_is_saved_loaded_and_shown(self):
-        race = Race(Track(1), 7, [8], max_runtime=5, save_path=self.save_path)
-
-        def score(car, track, dt):
-            car.best_progress = track.length * 0.7
-        with patch.object(Car, "update", score):
-            race.update(1)
-            race.elapsed = race.heat_limit
-            race.update(0)
-        self.assertAlmostEqual(load_networks(self.save_path).best_score, 70)
+            self.finish_heat(race)
+        self.assertAlmostEqual(load_networks(self.save_path).best_score, saved.best_score)
         app = App()
-        self.assertAlmostEqual(app.race.best_score_ever, 70)
+        self.assertAlmostEqual(app.race.best_score_ever, saved.best_score)
         app.draw_world()
-        # A restart keeps the record and does not clobber the saved networks.
-        saved = load_networks(self.save_path).networks
+        # Restarting keeps the record and never overwrites the saved model with a weaker one.
         app.handle_action("apply")
-        self.assertAlmostEqual(app.race.best_score_ever, 70)
-        app.race.best_score_ever = 90
+        self.assertAlmostEqual(app.race.best_score_ever, saved.best_score)
+        with patch.object(Car, "update", return_value=None):
+            self.finish_heat(app.race)
         app.race.save_now()
-        after = load_networks(self.save_path)
-        self.assertAlmostEqual(after.best_score, 90)
-        self.assertEqual(after.networks[0].weights, saved[0].weights)
+        self.assertEqual(load_networks(self.save_path).networks[0].weights, champion.weights)
 
     def test_bad_or_missing_save_files_are_ignored(self):
         self.assertIsNone(load_networks(self.save_path))
@@ -456,7 +464,7 @@ class RaceTests(unittest.TestCase):
         save_networks(self.save_path, brains, 7)
         app = App()
         self.assertEqual((app.inputs, app.hidden, app.road_level), (5, [6, 4], 1))
-        self.assertEqual(app.race.saved_tracks, 7)
+        self.assertEqual(app.race.record_tracks, 7)
         self.assertEqual(app.race.cars[0].brain.weights, brains[0].weights)
         self.assertEqual(app.race.tracks_completed, 0)
         self.assertEqual(len(app.race.cars), POPULATION)

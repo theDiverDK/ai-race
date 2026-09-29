@@ -43,11 +43,13 @@ To avoid overfitting one road, sensor readings carry a little noise and cars sta
 
 ### Score
 
-Every car has a score: 100 points per lap driven (fractions count, so a crash keeps what it earned), plus up to 50 for pace once it has finished a lap (its fastest lap against top speed), all multiplied by `1 + 0.1 × (road − 1)` so later roads are worth more. The **Score** line shows the highest-scoring car in the current heat, and **Best score ever** the highest any car has reached.
+A higher score means a better model, so the score belongs to the champion's run rather than to a single heat. Each finished lap earns 100 points plus up to 50 for pace (its lap time against top speed), the lap in progress earns a fraction of 100, and everything is multiplied by `1 + 0.1 × (road − 1)` so later roads are worth more. The **Run score** adds this up across every road the champion completes in a row, so it only grows while the champion keeps driving and keeps going into the random-road phase.
+
+The run score resets to 0 when the champion is dethroned or crashes (the same moment the tracks counter resets). **Best score ever** never resets: it is the highest run score any model has reached, and it turns green with **NEW RECORD** while the current run is at it. Before the first champion exists, the score is that of the best car.
 
 ### Saved network
 
-Each time the champion completes a road and sets a new record for tracks completed, the champion and runner-up are saved to `best_network.json` (git-ignored). The best score ever is stored in the same file, written when a heat ends with a new record and again on quit, and it is loaded on startup. On startup the app loads that file, adopts its network layout, and seeds the population from it (always beginning on Road 1); if the file is missing or unreadable it starts from scratch. **Restart Training** (`R`) always starts from scratch, and the file is only replaced once the new run beats the saved record.
+The model that set the best score ever is saved to `best_network.json` (git-ignored), together with the score and how many tracks that run completed. It is written when a heat ends with a new record and again on quit. On startup the app loads it, adopts its network layout, seeds the population from it and starts on Road 1; if the file is missing or unreadable it starts from scratch. **Restart Training** (`R`) starts from scratch but keeps the record, and the file is only replaced when a new model beats the saved score.
 
 To run the checks:
 
