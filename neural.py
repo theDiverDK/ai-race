@@ -8,6 +8,7 @@ import random
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import Callable
 
 
 WEIGHT_MUTATION_STD = 0.15
@@ -26,11 +27,12 @@ SAVE_VERSION = 3  # v3: networks have a speed input
 
 
 @lru_cache(maxsize=64)
-def _forward_for(sizes: tuple[int, ...]):
+def _forward_for(sizes: tuple[int, ...]) -> Callable[[Network, list[float]], tuple[float, float, float]]:
     """Specialize the arithmetic to a topology, reading live parameters each call."""
     lines = ["def forward(brain, inputs):"]
     previous = [f"v0_{i}" for i in range(sizes[0])]
-    lines.append("    " + ", ".join(previous) + ", = inputs")
+    if previous:
+        lines.append("    " + ", ".join(previous) + ", = inputs")
     for layer, (width, count) in enumerate(zip(sizes, sizes[1:])):
         lines.append(f"    weights = brain.weights[{layer}]")
         lines.append(f"    biases = brain.biases[{layer}]")
@@ -39,13 +41,15 @@ def _forward_for(sizes: tuple[int, ...]):
             name = f"v{layer + 1}_{i}"
             current.append(name)
             names = [f"w{j}" for j in range(width)]
-            lines.append("    " + ", ".join(names) + f", = weights[{i}]")
+            if names:
+                lines.append("    " + ", ".join(names) + f", = weights[{i}]")
             terms = ", ".join(f"w{j} * {previous[j]}" for j in range(width))
-            expression = f"sum(({terms},)) + biases[{i}]"
+            # Keep sum() and a separate skip sum so rounding matches the generic loop.
+            expression = f"sum(({terms}{',' if terms else ''})) + biases[{i}]"
             if layer == len(sizes) - 2:
                 lines.append(f"    shortcut = brain.skip[{i}] if brain.skip else ()")
                 terms = ", ".join(f"shortcut[{j}] * v0_{j}" for j in range(sizes[0]))
-                expression = f"({expression} + sum(({terms},))) if shortcut else ({expression})"
+                expression = f"({expression} + sum(({terms}{',' if terms else ''}))) if brain.skip else ({expression})"
             lines.append(f"    {name} = tanh({expression})")
         previous = current
     lines.append("    return " + ", ".join(previous[:3]))

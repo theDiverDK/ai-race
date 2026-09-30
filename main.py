@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 
 import pygame
@@ -150,12 +149,6 @@ def pinched_width(width: int, theta: float, centers: tuple[float, ...], depth: f
     return round(width * (1 - reduction))
 
 
-@lru_cache(maxsize=32)
-def _sensor_offsets(count: int) -> tuple[float, ...]:
-    spread = math.radians(105)
-    return tuple(-spread + 2 * spread * i / (count - 1) for i in range(count))
-
-
 class Track:
     def __init__(self, level: int = 1, mirror: bool = False, reverse: bool = False) -> None:
         if not 1 <= level <= len(ROAD_SPECS):
@@ -258,12 +251,13 @@ class Track:
 
     def sense(self, x: float, y: float, angle: float, count: int) -> list[float]:
         # Every input neuron corresponds to one evenly spaced road-edge ray.
+        spread = math.radians(105)
         values = []
         pixels = self._road_pixels
         width, height = WORLD_W, HEIGHT
         steps = range(6, SENSOR_RANGE + 1, 5)
-        for offset in _sensor_offsets(count):
-            ray_angle = angle + offset
+        for i in range(count):
+            ray_angle = angle + (-spread + 2 * spread * i / (count - 1))
             dx, dy = math.cos(ray_angle), math.sin(ray_angle)
             distance = SENSOR_RANGE
             for step in steps:
@@ -279,7 +273,7 @@ class Track:
         best_distance = float("inf")
         best_progress = 0.0
         best_index = near
-        for i, ax, ay, vx, vy, segment_squared, start, length in self._progress_windows[near]:
+        for i, ax, ay, vx, vy, segment_squared, start, length in self._progress_windows[near % self.count]:
             t = ((x - ax) * vx + (y - ay) * vy) / segment_squared
             if t <= 0.0:
                 t = 0.0
