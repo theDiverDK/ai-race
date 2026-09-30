@@ -19,7 +19,7 @@ python main.py
 
 | Control | Action |
 | --- | --- |
-| **Algorithm** | Switch between **Evolution** and **PPO**. Each mode keeps its in-memory training state while you use the other mode. Evolution saves `best_network.json`; PPO saves `ppo_checkpoint.pt`. |
+| **Algorithm dropdown** | Choose **Evolution** or **PPO**. The selected mode is saved in `app_settings.json` and restored on startup. Both modes use the same control layout, and each keeps its in-memory training state while you use the other. Evolution saves `best_network.json`; PPO saves `ppo_checkpoint.pt`. |
 | Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks, and restarts the gauntlet there. |
 | Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
 | **Limit On / Limit Off** | Turn the time limit on or off. In Evolution, a heat then continues until every car has crashed or stalled. In PPO, each car restarts after a crash, and automatic road progression waits until the limit is enabled. |
@@ -34,7 +34,7 @@ python main.py
 
 ### PPO
 
-PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel, all on the displayed road. Each car samples its own controls, and all eight are visible and contribute to training. A run counts as clean only when a car reaches the enabled time limit while still driving. After five clean runs across the group, all eight cars move to the next road together, cycling through all 11 roads. Crashes do not advance the road counter. Choosing a road in the UI resets the count and moves the whole group there. With the time limit disabled, runs continue until a car crashes, so the road stays selected until the limit is enabled or you choose another road.
+PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel, all on the displayed road. Each car samples its own controls, and all eight are visible and contribute to training. A round counts as one clean run when at least one car reaches the enabled time limit while still driving. Several cars finishing together still count as one run. The whole group restarts after a clean run; after five, it moves to the next road, cycling through all 11 roads. Crashes alone do not advance the road counter. Choosing a road in the UI resets the count and moves the whole group there. With the time limit disabled, runs continue until a car crashes, so the road stays selected until the limit is enabled or you choose another road.
 
 Each step rewards forward progress, gives a small lap bonus, and penalizes crashes and wasted time. After 256 steps per worker, PPO computes generalized advantage estimates and performs four epochs of clipped policy updates in small batches. Optimization is spread over UI frames; all eight cars continue driving while it runs. The network architecture controls also apply to PPO. Switching away pauses its trainer, and returning resumes it. **Apply & Restart** starts a fresh policy for the selected mode.
 

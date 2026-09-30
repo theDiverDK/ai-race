@@ -109,6 +109,30 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(len(race.rollout), 1)
         np.testing.assert_array_equal(race.rollout[0]["dones"], np.ones(main.PPO_WORKERS))
 
+    def test_simultaneous_ppo_finishes_count_as_one_clean_run(self):
+        race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
+        with patch.object(Car, "move", return_value=None):
+            for count in range(1, main.PPO_CLEAN_RUNS_PER_ROAD + 1):
+                for car in race.cars:
+                    car.time = race.heat_limit
+                race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
+                self.assertEqual(race.clean_runs_on_road, count % main.PPO_CLEAN_RUNS_PER_ROAD)
+                self.assertEqual(race.track.level, 1 if count < main.PPO_CLEAN_RUNS_PER_ROAD else 2)
+                self.assertTrue(all(car.time == 0 for car in race.cars))
+        self.assertEqual(race.episodes, main.PPO_WORKERS * main.PPO_CLEAN_RUNS_PER_ROAD)
+        np.testing.assert_array_equal(race.rollout[0]["dones"], np.ones(main.PPO_WORKERS))
+
+    def test_ppo_panel_shows_completed_clean_rounds(self):
+        app = App()
+        app.handle_action("algorithm:ppo")
+        app.race.clean_runs_on_road = 2
+        with patch.object(app, "label", wraps=app.label) as label:
+            app.draw_panel()
+        self.assertTrue(any(
+            call.args[0] == "Clean runs: 2/5 to next road"
+            for call in label.call_args_list
+        ))
+
     def test_crashes_and_unlimited_time_do_not_count_as_clean_runs(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         race.worker_cars[0].time = race.heat_limit
@@ -157,7 +181,7 @@ class PPOTests(unittest.TestCase):
 
     def test_app_displays_road_advanced_by_ppo_cars(self):
         app = App()
-        app.handle_action("algorithm")
+        app.handle_action("algorithm:ppo")
         app.speed = 1
         app.race.clean_runs_on_road = main.PPO_CLEAN_RUNS_PER_ROAD - 1
         app.race.worker_cars[0].time = app.race.heat_limit
@@ -172,36 +196,75 @@ class PPOTests(unittest.TestCase):
     def test_algorithm_switch_preserves_both_in_memory_trainers(self):
         app = App()
         evolution = app.race
-        app.handle_action("algorithm")
+        app.handle_action("algorithm:ppo")
         self.assertEqual(app.algorithm, "ppo")
         ppo = app.race
         ppo.update(1 / 60)
         app.draw_world()
         app.draw_panel()
-        app.handle_action("algorithm")
+        app.handle_action("algorithm:evolution")
         self.assertIs(app.race, evolution)
-        app.handle_action("algorithm")
+        app.handle_action("algorithm:ppo")
         self.assertIs(app.race, ppo)
         app.handle_action("road:+")
         self.assertEqual(app.track.level, 2)
         self.assertIs(app.race.cars, app.race.worker_cars)
         self.assertTrue(all(track is app.track for track in app.race.worker_tracks))
 
-    def test_algorithm_button_switches_mode_in_event_loop(self):
+    def test_algorithm_dropdown_switches_mode_in_event_loop(self):
         app = App()
         app.draw_panel()
-        button = next(rect for rect, action in app.buttons if action == "algorithm")
-        click = pygame.event.Event(
+        button = next(rect for rect, action in app.buttons if action == "algorithm:menu")
+        open_menu = pygame.event.Event(
             pygame.MOUSEBUTTONDOWN,
             {"window": app.main_window, "pos": button.center, "button": 1},
         )
-        with patch("pygame.event.get", side_effect=[[click], [pygame.event.Event(pygame.QUIT)]]):
+        choose_ppo = pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            {"window": app.main_window, "pos": (main.WORLD_W + 180, 139), "button": 1},
+        )
+        with patch("pygame.event.get", side_effect=[
+            [open_menu], [choose_ppo], [pygame.event.Event(pygame.QUIT)],
+        ]):
             app.run()
         self.assertEqual(app.algorithm, "ppo")
+        self.assertFalse(app.algorithm_menu_open)
+        self.assertFalse(app.paused)
+
+    def test_selected_algorithm_and_ppo_topology_restore_on_startup(self):
+        app = App()
+        app.handle_action("algorithm:ppo")
+        app.handle_action("inputs:+")
+        app.handle_action("hidden0:+")
+        app.handle_action("apply")
+        app.race.agent.updates = 3
+        app.race.agent.save(app.ppo_path)
+        restored = App()
+        self.assertEqual(restored.algorithm, "ppo")
+        self.assertEqual(restored.race.sizes, app.race.sizes)
+        self.assertEqual(restored.race.agent.updates, 3)
+        restored.handle_action("algorithm:evolution")
+        self.assertEqual(App().algorithm, "evolution")
+
+    def test_invalid_algorithm_settings_fall_back_to_evolution(self):
+        settings = self.directory / "app_settings.json"
+        settings.write_text("{broken", encoding="utf-8")
+        self.assertEqual(App().algorithm, "evolution")
+        settings.write_text('{"algorithm": "ppo", "ppo": {"inputs": true}}', encoding="utf-8")
+        self.assertEqual(App().algorithm, "ppo")
+
+    def test_both_algorithms_use_the_same_control_layout(self):
+        app = App()
+        app.draw_panel()
+        positions = {action: rect for rect, action in app.buttons}
+        app.handle_action("algorithm:ppo")
+        app.draw_panel()
+        for rect, action in app.buttons:
+            self.assertEqual(rect, positions[action])
 
     def test_network_controls_apply_to_ppo_policy(self):
         app = App()
-        app.handle_action("algorithm")
+        app.handle_action("algorithm:ppo")
         app.handle_action("inputs:+")
         app.handle_action("layers:+")
         app.handle_action("hidden2:+")

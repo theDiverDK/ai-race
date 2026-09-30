@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import json
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -842,27 +843,29 @@ class PPORace:
                 )
         next_values = self.agent.value(post_observations)
         next_values[terminated] = 0.0
-        self.clean_runs_on_road += clean_finishes
-        switch_road = self.clean_runs_on_road >= PPO_CLEAN_RUNS_PER_ROAD
-        if switch_road:
-            # End every rollout together before changing roads. Living cars are
-            # truncated and keep their bootstrap values for PPO training.
+        clean_round = clean_finishes > 0
+        if clean_round:
+            # Several cars can finish in the same frame. Count their shared
+            # round once, then start the whole group together again.
+            self.clean_runs_on_road += 1
             dones[:] = 1.0
+        switch_road = clean_round and self.clean_runs_on_road >= PPO_CLEAN_RUNS_PER_ROAD
         for row, index in enumerate(indices):
             if dones[row]:
                 self.recent_returns.append(self.worker_returns[index])
                 self.recent_returns = self.recent_returns[-40:]
                 self.episodes += 1
-                if not switch_road:
+                if not clean_round:
                     self._reset_worker(index)
             else:
                 self.worker_obs[index] = post_observations[row].tolist()
-        if switch_road:
-            next_level = self.track.level % len(ROAD_SPECS) + 1
-            self.track = self.track_for(next_level, False, False)
-            self.clean_runs_on_road = 0
-            self.best_ever = 0.0
-            self.fastest_ever = None
+        if clean_round:
+            if switch_road:
+                next_level = self.track.level % len(ROAD_SPECS) + 1
+                self.track = self.track_for(next_level, False, False)
+                self.clean_runs_on_road = 0
+                self.best_ever = 0.0
+                self.fastest_ever = None
             for index in range(PPO_WORKERS):
                 self._reset_worker(index)
         if collect:
@@ -875,7 +878,7 @@ class PPORace:
                 "dones": dones,
                 "next_values": next_values,
             })
-        self.elapsed = self.worker_cars[0].time
+        self.elapsed = max(car.time for car in self.worker_cars)
 
     def update(self, dt: float) -> None:
         if self.agent.optimizing:
@@ -942,6 +945,9 @@ class App:
         self.bold = pygame.font.SysFont("Avenir Next", 20, bold=True)
         self.title = pygame.font.SysFont("Avenir Next", 32, bold=True)
         self.save_path = save_path or SAVE_PATH
+        self.settings_path = self.save_path.with_name("app_settings.json")
+        settings = self._read_settings()
+        self.ppo_topology = self._valid_topology(settings.get("ppo"))
         self.inputs = 7
         self.hidden = [DEFAULT_HIDDEN_WIDTH, DEFAULT_HIDDEN_WIDTH]
         self.max_runtime = DEFAULT_MAX_RUNTIME
@@ -962,11 +968,75 @@ class App:
         self.evolution_race = self.race
         self.ppo_race: PPORace | None = None
         self.ppo_path = self.save_path.with_name("ppo_checkpoint.pt")
+        self.algorithm_menu_open = False
         self.paused = False
         self.speed = 4
         self.show_sensors = True
         self.buttons: list[tuple[pygame.Rect, str]] = []
         self.inspector: NetworkInspector | None = None
+        if settings.get("algorithm") == "ppo":
+            self.select_algorithm("ppo", remember=False)
+
+    def _read_settings(self) -> dict:
+        try:
+            payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _valid_topology(payload: object) -> tuple[int, list[int]] | None:
+        if not isinstance(payload, dict):
+            return None
+        inputs, hidden = payload.get("inputs"), payload.get("hidden")
+        if (type(inputs) is int and 3 <= inputs <= 15 and isinstance(hidden, list)
+                and 1 <= len(hidden) <= 5
+                and all(type(width) is int and 2 <= width <= 24 for width in hidden)):
+            return inputs, hidden[:]
+        return None
+
+    def _save_settings(self) -> None:
+        if self.ppo_race is not None:
+            self.ppo_topology = self.ppo_race.inputs, self.ppo_race.hidden[:]
+        payload = {"algorithm": self.algorithm}
+        if self.ppo_topology is not None:
+            payload["ppo"] = {"inputs": self.ppo_topology[0], "hidden": self.ppo_topology[1]}
+        temporary = self.settings_path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(self.settings_path)
+        except OSError:
+            pass
+
+    def select_algorithm(self, algorithm: str, remember: bool = True) -> None:
+        self.algorithm_menu_open = False
+        if algorithm == self.algorithm:
+            return
+        self.race.save_now()
+        if algorithm == "ppo":
+            self.evolution_race = self.race
+            if self.ppo_race is None:
+                inputs, hidden = self.ppo_topology or (self.inputs, self.hidden)
+                self.ppo_race = PPORace(
+                    Track(1), inputs, hidden, self.max_runtime,
+                    self.time_limit_enabled, self.ppo_path,
+                )
+            self.race = self.ppo_race
+        elif algorithm == "evolution":
+            self.ppo_race = self.race
+            self.race = self.evolution_race
+        else:
+            raise ValueError(f"Unknown algorithm: {algorithm}")
+        self.algorithm = algorithm
+        self.track = self.race.track
+        self.road_level = self.track.level
+        self.inputs = self.race.inputs
+        self.hidden = self.race.hidden[:]
+        self.max_runtime = self.race.max_runtime
+        self.time_limit_enabled = self.race.time_limit_enabled
+        self.paused = False
+        if remember:
+            self._save_settings()
 
     def label(self, text: str, x: int, y: int, color=TEXT, font=None) -> None:
         self.screen.blit((font or self.font).render(text, True, color), (x, y))
@@ -998,28 +1068,10 @@ class App:
         elif action == "limit":
             self.time_limit_enabled = not self.time_limit_enabled
             self.race.time_limit_enabled = self.time_limit_enabled
-        elif action == "algorithm":
-            self.race.save_now()
-            if self.algorithm == "evolution":
-                self.evolution_race = self.race
-                self.algorithm = "ppo"
-                if self.ppo_race is None:
-                    self.ppo_race = PPORace(
-                        Track(1), self.inputs, self.hidden, self.max_runtime,
-                        self.time_limit_enabled, self.ppo_path,
-                    )
-                self.race = self.ppo_race
-            else:
-                self.ppo_race = self.race
-                self.algorithm = "evolution"
-                self.race = self.evolution_race
-            self.track = self.race.track
-            self.road_level = self.track.level
-            self.inputs = self.race.inputs
-            self.hidden = self.race.hidden[:]
-            self.max_runtime = self.race.max_runtime
-            self.time_limit_enabled = self.race.time_limit_enabled
-            self.paused = False
+        elif action in ("algorithm", "algorithm:menu"):
+            self.algorithm_menu_open = not self.algorithm_menu_open
+        elif action in ("algorithm:evolution", "algorithm:ppo"):
+            self.select_algorithm(action.split(":", 1)[1])
         elif action == "apply":
             # A fresh start on road 1; the saved file is only replaced by a new record.
             self.road_level = 1
@@ -1030,6 +1082,8 @@ class App:
                     self.time_limit_enabled, self.ppo_path, resume=False,
                 )
                 self.ppo_race = self.race
+                self.ppo_topology = self.inputs, self.hidden[:]
+                self._save_settings()
             else:
                 self.race = Race(
                     self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
@@ -1090,9 +1144,8 @@ class App:
     def draw_world(self) -> None:
         self.screen.blit(self.track.art, (0, 0))
         self.draw_cars()
-        hud_height = 118 if self.algorithm == "ppo" else 196
-        hud_x = WORLD_W - 255 if self.algorithm == "ppo" else 22
-        pygame.draw.rect(self.screen, (11, 22, 30), (hud_x, 22, 233, hud_height), border_radius=12)
+        hud_x = WORLD_W - 255
+        pygame.draw.rect(self.screen, (11, 22, 30), (hud_x, 22, 233, 196), border_radius=12)
         self.label("NEURAL CIRCUIT", hud_x + 15, 32, ACCENT, self.small)
         if self.algorithm == "ppo":
             self.label(f"PPO update {self.race.agent.updates:03d}", hud_x + 15, 56, TEXT, self.bold)
@@ -1100,14 +1153,14 @@ class App:
             self.label(f"Episodes: {self.race.episodes}", hud_x + 15, 108, ACCENT, self.font)
             lines = [*(self.race.last_result or ()), "All visible cars contribute to PPO training."]
         else:
-            self.label(f"Generation {self.race.generation:02d}", 37, 56, TEXT, self.bold)
+            self.label(f"Generation {self.race.generation:02d}", hud_x + 15, 56, TEXT, self.bold)
             alive = sum(car.alive for car in self.race.cars)
-            self.label(f"{alive:02d} / {POPULATION} cars on track", 38, 84, MUTED, self.small)
-            self.label(f"Tracks completed: {self.race.tracks_completed}", 37, 108, ACCENT, self.font)
+            self.label(f"{alive:02d} / {POPULATION} cars on track", hud_x + 16, 84, MUTED, self.small)
+            self.label(f"Tracks completed: {self.race.tracks_completed}", hud_x + 15, 108, ACCENT, self.font)
             lap_text = f"Lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
-            self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), 38, 133, MUTED, self.small)
-            self.label(f"Run score: {self.race.current_score:,.0f}", 37, 160, ORANGE, self.font)
-            self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", 38, 186, MUTED, self.small)
+            self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), hud_x + 16, 133, MUTED, self.small)
+            self.label(f"Run score: {self.race.current_score:,.0f}", hud_x + 15, 160, ORANGE, self.font)
+            self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", hud_x + 16, 186, MUTED, self.small)
             probes = ", ".join(track.label for track, _ in self.race.probes)
             lines = [*(self.race.last_result or ()), f"Every car is also tested on: {probes}"]
         top = HEIGHT - 66 - 21 * len(lines)
@@ -1133,8 +1186,15 @@ class App:
         self.label("Train the drivers", x + 22, 39, TEXT, self.title)
         self.button(
             pygame.Rect(x + 22, 77, 316, 27),
-            f"ALGORITHM: {self.algorithm.upper()}  ·  CLICK TO SWITCH", "algorithm",
+            f"ALGORITHM: {self.algorithm.upper()}",
+            "algorithm:menu",
         )
+        arrow = (
+            ((x + 316, 94), (x + 326, 94), (x + 321, 87))
+            if self.algorithm_menu_open else
+            ((x + 316, 87), (x + 326, 87), (x + 321, 94))
+        )
+        pygame.draw.polygon(self.screen, TEXT, arrow)
 
         self.button(pygame.Rect(x + 22, 109, 146, 32), "RESUME" if self.paused else "PAUSE", "pause")
         self.button(pygame.Rect(x + 177, 109, 160, 32), f"SPEED  {self.speed}×", "speed")
@@ -1203,6 +1263,13 @@ class App:
             pygame.Rect(x + 184, 755, 154, 38),
             "APPLY & RESTART" if dirty else "RESTART TRAINING", "apply", primary=True,
         )
+        if self.algorithm_menu_open:
+            pygame.draw.rect(self.screen, (46, 65, 73), (x + 20, 105, 320, 62), border_radius=8)
+            for row, (algorithm, title) in enumerate((("evolution", "EVOLUTION"), ("ppo", "PPO"))):
+                self.button(
+                    pygame.Rect(x + 23, 108 + row * 28, 314, 27),
+                    title, f"algorithm:{algorithm}", primary=self.algorithm == algorithm,
+                )
 
     def run(self) -> None:
         running = True
@@ -1236,10 +1303,14 @@ class App:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if window_id not in (None, self.main_window_id):
                         continue
-                    for rect, action in self.buttons:
+                    clicked = False
+                    for rect, action in reversed(self.buttons):
                         if rect.collidepoint(event.pos):
                             self.handle_action(action)
+                            clicked = True
                             break
+                    if not clicked:
+                        self.algorithm_menu_open = False
 
             if not self.paused:
                 for _ in range(self.speed):
@@ -1256,6 +1327,7 @@ class App:
         if self.inspector:
             self.inspector.close()
         self.race.save_now()
+        self._save_settings()
         pygame.quit()
 
 
