@@ -271,7 +271,11 @@ class Track:
         best_progress = 0.0
         best_index = near
         for i, ax, ay, vx, vy, segment_squared, start, length in self._progress_windows[near]:
-            t = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / segment_squared))
+            t = ((x - ax) * vx + (y - ay) * vy) / segment_squared
+            if t <= 0.0:
+                t = 0.0
+            elif t >= 1.0:
+                t = 1.0
             distance = (x - ax - t * vx) ** 2 + (y - ay - t * vy) ** 2
             if distance < best_distance:
                 best_distance = distance
