@@ -78,6 +78,52 @@ class PPOTests(unittest.TestCase):
         self.assertTrue(race.cars[0] is not car or race.cars[0].time > old_time)
         self.assertIs(race.cars[0], race.worker_cars[0])
 
+    def test_visible_worker_cycles_roads_after_five_episodes(self):
+        race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
+        hidden_cars = race.worker_cars[1:]
+        hidden_tracks = race.worker_tracks[1:]
+        for count in range(1, main.PPO_VISIBLE_EPISODES_PER_ROAD):
+            race.worker_cars[0].time = race.heat_limit
+            race._advance([0], 0.0, collect=False)
+            self.assertEqual(race.track.level, 1)
+            self.assertEqual(race.visible_episodes_on_road, count)
+        race.best_ever = 100.0
+        race.worker_cars[0].time = race.heat_limit
+        race._advance([0], 0.0, collect=True)
+        self.assertEqual(race.track.level, 2)
+        self.assertEqual(race.worker_tracks[0].level, 2)
+        self.assertIs(race.cars[0], race.worker_cars[0])
+        self.assertEqual(race.visible_episodes_on_road, 0)
+        self.assertEqual(race.best_ever, 0.0)
+        self.assertEqual(len(race.rollout), 1)
+        self.assertEqual(race.rollout[0]["dones"][0], 1.0)
+        self.assertEqual(race.worker_cars[1:], hidden_cars)
+        self.assertEqual(race.worker_tracks[1:], hidden_tracks)
+
+    def test_manual_ppo_road_choice_restarts_count_and_last_road_wraps(self):
+        race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
+        race.worker_cars[0].time = race.heat_limit
+        race._advance([0], 0.0, collect=False)
+        race.change_track(Track(len(main.ROAD_SPECS)))
+        self.assertEqual(race.visible_episodes_on_road, 0)
+        for _ in range(main.PPO_VISIBLE_EPISODES_PER_ROAD):
+            race.worker_cars[0].time = race.heat_limit
+            race._advance([0], 0.0, collect=False)
+        self.assertEqual(race.track.level, 1)
+        self.assertEqual(race.visible_episodes_on_road, 0)
+
+    def test_app_displays_road_advanced_by_visible_ppo_worker(self):
+        app = App()
+        app.handle_action("algorithm")
+        app.speed = 1
+        app.race.visible_episodes_on_road = main.PPO_VISIBLE_EPISODES_PER_ROAD - 1
+        app.race.worker_cars[0].time = app.race.heat_limit
+        with patch("pygame.event.get", side_effect=[[], [pygame.event.Event(pygame.QUIT)]]):
+            app.run()
+        self.assertEqual(app.road_level, 2)
+        self.assertIs(app.track, app.race.track)
+        self.assertIs(app.race.cars[0], app.race.worker_cars[0])
+
     def test_algorithm_switch_preserves_both_in_memory_trainers(self):
         app = App()
         evolution = app.race

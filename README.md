@@ -34,7 +34,7 @@ python main.py
 
 ### PPO
 
-PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel. **The car on screen is worker 1 and is actually contributing to training**; the other seven drive on roads that are simulated without drawing them. The visible worker uses the road chosen in the UI. Other workers sample roads and orientations from a curriculum that unlocks harder roads as training proceeds.
+PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel. **The car on screen is worker 1 and is actually contributing to training**; the other seven drive on roads that are simulated without drawing them. The visible worker advances to the next road after five completed runs, cycling through all 11 roads. Choosing a road in the UI starts a fresh five-run count there. Other workers sample roads and orientations from a curriculum that unlocks harder roads as training proceeds.
 
 Each step rewards forward progress, gives a small lap bonus, and penalizes crashes and wasted time. After 256 steps per worker, PPO computes generalized advantage estimates and performs four epochs of clipped policy updates in small batches. Optimization is spread over UI frames; the visible car continues driving while it runs. The network architecture controls also apply to PPO. Switching away pauses its trainer, and returning resumes it. **Apply & Restart** starts a fresh policy for the selected mode.
 

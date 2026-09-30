@@ -64,6 +64,7 @@ PROBE_COUNT = 2
 PROBE_MIN_LEVEL = 5
 PPO_WORKERS = 8
 PPO_ROLLOUT_STEPS = 256
+PPO_VISIBLE_EPISODES_PER_ROAD = 5
 # A car that does not gain STAGNATION_DISTANCE px of forward progress for
 # STAGNATION_SECONDS is out. Without this, a network can drive in circles (or back
 # and forth) on the road forever: it never crashes, so a champion doing it is never
@@ -734,6 +735,7 @@ class PPORace:
         self.worker_cars: list[Car] = []
         self.worker_obs: list[list[float]] = []
         self.worker_returns = [0.0] * PPO_WORKERS
+        self.visible_episodes_on_road = 0
         self.cars: list[Car] = []
         for index in range(PPO_WORKERS):
             self._reset_worker(index)
@@ -771,7 +773,7 @@ class PPORace:
                 track = self.track
             else:
                 # Unlock harder roads as the policy starts to learn. The visible
-                # worker always trains on the road selected in the UI.
+                # worker cycles through every road after a few episodes.
                 unlocked = min(len(ROAD_SPECS), 5 + self.agent.updates // 5)
                 level = self.rng.randint(1, unlocked)
                 mirror, reverse = self.rng.choice(ORIENTATIONS)
@@ -842,6 +844,14 @@ class PPORace:
                 self.recent_returns.append(self.worker_returns[index])
                 self.recent_returns = self.recent_returns[-40:]
                 self.episodes += 1
+                if index == 0:
+                    self.visible_episodes_on_road += 1
+                    if self.visible_episodes_on_road >= PPO_VISIBLE_EPISODES_PER_ROAD:
+                        next_level = self.track.level % len(ROAD_SPECS) + 1
+                        self.track = self.track_for(next_level, False, False)
+                        self.visible_episodes_on_road = 0
+                        self.best_ever = 0.0
+                        self.fastest_ever = None
                 self._reset_worker(index)
             else:
                 self.worker_obs[index] = post_observations[row].tolist()
@@ -883,6 +893,7 @@ class PPORace:
         self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
         self.fastest_ever = None
+        self.visible_episodes_on_road = 0
         self.rollout.clear()
         self._reset_worker(0, track)
         self.elapsed = 0.0
@@ -1141,7 +1152,10 @@ class App:
         road_name = self.small.render(self.track.name, True, MUTED)
         self.screen.blit(road_name, road_name.get_rect(center=(x + 180, 345)))
         if self.algorithm == "ppo":
-            auto_text = "Visible worker + 7 hidden training rollouts"
+            auto_text = (
+                f"Visible road: {self.race.visible_episodes_on_road}/"
+                f"{PPO_VISIBLE_EPISODES_PER_ROAD} runs  •  7 hidden workers"
+            )
         else:
             auto_text = (
                 f"Tracks completed: {self.race.tracks_completed}  •  "
