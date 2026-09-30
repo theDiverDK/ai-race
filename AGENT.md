@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository. See `README.md` for us
 
 ## Project
 
-Neural Circuit: a Pygame race simulation where 50 cars learn to drive through neuroevolution. There is no backpropagation and no pretrained model. Small fully connected `tanh` networks read a fan of distance sensors and output three continuous controls (steering, signed drive, brake).
+Neural Circuit: a Pygame race simulation with selectable neuroevolution and PPO training. Small networks read a fan of distance sensors and speed, then output three continuous controls (steering, signed drive, brake). PPO uses PyTorch backpropagation; evolution uses selection and mutation.
 
 ## Layout
 
@@ -12,14 +12,15 @@ Neural Circuit: a Pygame race simulation where 50 cars learn to drive through ne
 | --- | --- |
 | `main.py` | Entry point and simulation. Contains `Track` (road geometry, Catmull-Rom splines, pinched widths), `Car` (physics, sensors), `Race` (a heat: ranking, lap detection), `App` (UI, event loop, road switching). Constants such as `POPULATION`, `ROAD_SPECS`, `SENSOR_RANGE` and `LAPS_PER_ROAD` live at the top. |
 | `neural.py` | `Network` class, `next_generation()` (2 unchanged champions, 2 `minor_mutation` copies, bred children, random newcomers), and `save_networks()` / `load_networks()` for `best_network.json`. |
+| `ppo.py` | Actor-critic network, action sampling, generalized advantage estimates, clipped PPO minibatch updates, and `ppo_checkpoint.pt` persistence. |
 | `inspector.py` | `NetworkInspector`, the live network-visualisation window, and `activations()`. |
-| `test_race.py`, `test_neural.py` | `unittest` suites. |
+| `test_race.py`, `test_neural.py`, `test_ppo.py` | `unittest` suites. |
 
 ## Commands
 
 ```sh
 python3.13 -m venv .venv && source .venv/bin/activate
-python -m pip install -r requirements.txt   # pygame>=2.6,<3
+python -m pip install -r requirements.txt   # Pygame, NumPy, PyTorch
 python main.py                              # run the app
 python -m unittest -v                       # run all tests
 ```
@@ -29,6 +30,9 @@ Tests set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`, so they run headl
 ## Conventions and invariants
 
 - Every brain gets `sensors + EXTRA_INPUTS` inputs (the last is the car's speed, `Car.inputs`; `Car.sensors` are only the rays) and has direct input-to-output `Network.skip` weights (`SKIP_CONNECTIONS`). `Race.inputs` and the UI stepper count sensors only; `Race.sizes[0]` includes the speed. Changing the input layout means bumping `SAVE_VERSION`. The output layer always has exactly 3 neurons. Drive is signed (negative means reverse, capped below forward speed). A positive brake output slows the car in either direction.
+- `Car.observe()` and `Car.move()` separate sensing from physics. `Car.update()` composes them for evolution; `PPORace` batches observations, samples controls from the shared policy, then calls the same `move()` method. Do not let the two algorithms drift into different physics.
+- PPO has `PPO_WORKERS` rollouts. Worker 0 is rendered and contributes to training; the others run without art. The policy's tanh mean is mirrored into a `Network` for the inspector, while actual driving samples a Gaussian and squashes it with tanh. `PPOAgent` stores unsquashed actions for correct PPO probability ratios.
+- PPO checkpoints are separate from `best_network.json` and must keep actor, critic, optimizer, topology, and update count together. `App` retains both trainers in memory when switching algorithms. PPO rollout updates are split into minibatches so the UI keeps drawing.
 - Selection uses `Race.fitness(i)`: every brain also drives `PROBE_COUNT` hard probe roads (`Race.probes`, art-less `Track` variants, levels `PROBE_MIN_LEVEL` and up, random orientation, independent of the gauntlet road) in the same heat; fitness = 0.5 × mean + 0.5 × min of distance / `REFERENCE_SPEED × heat_limit`. `Car.rank_key` (laps, then distance) is only used to pick the leader shown on screen. Never rank on the shown road alone: that is how a network memorises a road.
 - `Track(level, mirror, reverse)` gives four orientations of each road; `Track.art` is drawn lazily, so only shown roads cost memory. Always look roads up through `Race.track_for(level, mirror, reverse)`.
 - There are 11 roads. Roads 1, 2, 10 and 11 keep their original layouts, and `test_race.py` asserts on geometry such as the start point and road widths. Update those tests deliberately when you change `ROAD_SPECS`.
@@ -40,7 +44,7 @@ Tests set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`, so they run headl
 - Sensor noise (`SENSOR_NOISE`) and start-heading jitter are deliberate anti-overfitting measures; set `Car.sensor_noise = 0` when a test needs deterministic sensors.
 - Switching roads restarts the heat but keeps the networks. **Apply & Restart** and `R` start a new population.
 - The UI palette constants (`BG`, `PANEL`, `TEXT`, `MUTED` and so on) are duplicated in `main.py` and `inspector.py`. Keep them in sync.
-- The code is plain Python with type hints and no framework. Match the existing style, and keep changes small and self-contained.
+- Evolution is plain Python; PPO uses PyTorch and NumPy. Match the existing style, and keep changes small and self-contained.
 - If you change controls or behaviour, update `README.md` and the tests in the same change.
 
 ## Tuning learning speed

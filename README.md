@@ -1,12 +1,12 @@
 # Neural Circuit
 
-A Pygame race simulation where 50 cars learn to drive by evolving small neural networks. Each car sees the distance to the road edge through a fan of sensors and feels its own speed. Its network produces three continuous controls: left/right steering, forward/reverse drive, and a separate brake.
+A Pygame race simulation with two selectable training algorithms: neuroevolution and Proximal Policy Optimization (PPO). Each car sees the distance to the road edge through a fan of sensors and feels its own speed. Its network produces three continuous controls: left/right steering, forward/reverse drive, and a separate brake.
 
 The drive output is signed: positive accelerates forward and negative accelerates in reverse. A positive brake output slows the car in either direction; zero or negative releases the brake. Reverse speed is capped below forward speed.
 
 ## Run
 
-Python 3.13 is recommended. Create a virtual environment and install Pygame:
+Python 3.13 is recommended. Create a virtual environment and install Pygame, NumPy, and PyTorch:
 
 ```sh
 python3.13 -m venv .venv
@@ -19,6 +19,7 @@ python main.py
 
 | Control | Action |
 | --- | --- |
+| **Algorithm** | Switch between **Evolution** and **PPO**. Each mode keeps its in-memory training state while you use the other mode. Evolution saves `best_network.json`; PPO saves `ppo_checkpoint.pt`. |
 | Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks, and restarts the gauntlet there. |
 | Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
 | **Limit On / Limit Off** | Turn the time limit on or off. With it off, the heat continues until every car has left the road, stalled or stopped making progress. |
@@ -27,11 +28,21 @@ python main.py
 | **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Starts at 4×. |
 | `V` | Show or hide the leading car's sensor rays. |
 | `R` | Restart training with the current settings. |
-| **View Network** | Open a live window for the highest scoring car in the current generation. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its current activation, bias, weighted input, and exact incoming and outgoing connection weights. Scroll the details pane for longer lists. |
+| **View Network** | Open a live window for the highest scoring evolutionary car or the current PPO policy. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its activation, bias, weighted input, and exact connection weights. PPO shows the policy's mean action; exploration can make the car's sampled action differ. |
 
 ## How learning works
 
-Each generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. Cars are ranked by fitness (see below). At the end of a heat, the two best networks pass to the next generation unchanged, two lightly mutated copies of them (small nudges, no crossover) follow, most of the rest are bred and mutated from high-ranking cars, and a few are generated at random. This is neuroevolution; the app does not use backpropagation or a pretrained model.
+### PPO
+
+PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel. **The car on screen is worker 1 and is actually contributing to training**; the other seven drive on roads that are simulated without drawing them. The visible worker uses the road chosen in the UI. Other workers sample roads and orientations from a curriculum that unlocks harder roads as training proceeds.
+
+Each step rewards forward progress, gives a small lap bonus, and penalizes crashes and wasted time. After 256 steps per worker, PPO computes generalized advantage estimates and performs four epochs of clipped policy updates in small batches. Optimization is spread over UI frames; the visible car continues driving while it runs. The network architecture controls also apply to PPO. Switching away pauses its trainer, and returning resumes it. **Apply & Restart** starts a fresh policy for the selected mode.
+
+PPO checkpoints are saved separately to `ppo_checkpoint.pt` (git-ignored), periodically and on exit. A matching checkpoint loads when PPO is first selected after startup. The PPO display shows update count, episodes, best distance on the visible road, and mean episode reward. Rewards are training feedback; they are not the evolutionary run score.
+
+### Evolution
+
+Each evolutionary generation starts with 50 cars. Their sensor distances feed a fully connected network with `tanh` neurons. Cars are ranked by fitness (see below). At the end of a heat, the two best networks pass to the next generation unchanged, two lightly mutated copies of them (small nudges, no crossover) follow, most of the rest are bred and mutated from high-ranking cars, and a few are generated at random. Evolution does not use backpropagation.
 
 ### The gauntlet and the counter
 

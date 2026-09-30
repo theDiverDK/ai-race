@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 best_network.json
 best_network.json.tmp
+ppo_checkpoint.pt
+ppo_checkpoint.pt.tmp
