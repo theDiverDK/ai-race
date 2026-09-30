@@ -229,6 +229,9 @@ class Track:
         road_alpha = pygame.Surface((WORLD_W, HEIGHT), pygame.SRCALPHA)
         draw_road_band(road_alpha, self.points, self.widths, (255, 255, 255))
         self.mask = pygame.mask.from_surface(road_alpha)
+        # Road pixels are either transparent or fully opaque. A byte lookup avoids
+        # allocating a coordinate tuple and crossing into Mask.get_at for each ray sample.
+        self._road_pixels = pygame.image.tobytes(road_alpha, "RGBA")[3::4]
         self._art: pygame.Surface | None = None
         suffix = ORIENTATION_NAMES[(mirror, reverse)]
         self.label = f"Road {level}" + (f" {suffix}" if suffix else "")
@@ -250,7 +253,7 @@ class Track:
         # Every input neuron corresponds to one evenly spaced road-edge ray.
         spread = math.radians(105)
         values = []
-        get_at = self.mask.get_at  # inlined on_road(): this loop is the hottest code in the app
+        pixels = self._road_pixels
         width, height = WORLD_W, HEIGHT
         steps = range(6, SENSOR_RANGE + 1, 5)
         for i in range(count):
@@ -259,7 +262,7 @@ class Track:
             distance = SENSOR_RANGE
             for step in steps:
                 ix, iy = int(x + dx * step), int(y + dy * step)
-                if not (0 <= ix < width and 0 <= iy < height and get_at((ix, iy))):
+                if not (0 <= ix < width and 0 <= iy < height and pixels[iy * width + ix]):
                     distance = step
                     break
             values.append(distance / SENSOR_RANGE)
