@@ -38,8 +38,9 @@ def _forward_for(sizes: tuple[int, ...]):
         for i in range(count):
             name = f"v{layer + 1}_{i}"
             current.append(name)
-            lines.append(f"    row = weights[{i}]")
-            terms = ", ".join(f"row[{j}] * {previous[j]}" for j in range(width))
+            names = [f"w{j}" for j in range(width)]
+            lines.append("    " + ", ".join(names) + f", = weights[{i}]")
+            terms = ", ".join(f"w{j} * {previous[j]}" for j in range(width))
             expression = f"sum(({terms},)) + biases[{i}]"
             if layer == len(sizes) - 2:
                 lines.append(f"    shortcut = brain.skip[{i}] if brain.skip else ()")
