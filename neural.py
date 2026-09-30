@@ -6,7 +6,7 @@ import json
 import math
 import random
 from dataclasses import dataclass, field
-from operator import mul
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -23,6 +23,34 @@ MINOR_MUTATION_RATE = 0.10
 # need a handful of weights instead of a path through two random tanh layers.
 SKIP_CONNECTIONS = True
 SAVE_VERSION = 3  # v3: networks have a speed input
+
+
+@lru_cache(maxsize=64)
+def _forward_for(sizes: tuple[int, ...]):
+    """Specialize the arithmetic to a topology, reading live parameters each call."""
+    lines = ["def forward(brain, inputs):"]
+    previous = [f"v0_{i}" for i in range(sizes[0])]
+    lines.append("    " + ", ".join(previous) + ", = inputs")
+    for layer, (width, count) in enumerate(zip(sizes, sizes[1:])):
+        lines.append(f"    weights = brain.weights[{layer}]")
+        lines.append(f"    biases = brain.biases[{layer}]")
+        current = []
+        for i in range(count):
+            name = f"v{layer + 1}_{i}"
+            current.append(name)
+            lines.append(f"    row = weights[{i}]")
+            terms = ", ".join(f"row[{j}] * {previous[j]}" for j in range(width))
+            expression = f"sum(({terms},)) + biases[{i}]"
+            if layer == len(sizes) - 2:
+                lines.append(f"    shortcut = brain.skip[{i}] if brain.skip else ()")
+                terms = ", ".join(f"shortcut[{j}] * v0_{j}" for j in range(sizes[0]))
+                expression = f"({expression} + sum(({terms},))) if shortcut else ({expression})"
+            lines.append(f"    {name} = tanh({expression})")
+        previous = current
+    lines.append("    return " + ", ".join(previous[:3]))
+    namespace = {"tanh": math.tanh}
+    exec("\n".join(lines), namespace)
+    return namespace["forward"]
 
 
 @dataclass
@@ -56,20 +84,7 @@ class Network:
     def forward(self, inputs: list[float]) -> tuple[float, float, float]:
         if len(inputs) != self.sizes[0]:
             raise ValueError(f"Expected {self.sizes[0]} inputs, got {len(inputs)}")
-        values = inputs
-        tanh = math.tanh
-        last = len(self.weights) - 1
-        for index, (weights, biases) in enumerate(zip(self.weights, self.biases)):
-            # sum(map(mul, ...)) is several times faster than a generator here,
-            # and this runs for every car on every simulation step.
-            if index == last and self.skip:
-                values = [
-                    tanh(sum(map(mul, row, values)) + bias + sum(map(mul, shortcut, inputs)))
-                    for row, bias, shortcut in zip(weights, biases, self.skip)
-                ]
-            else:
-                values = [tanh(sum(map(mul, row, values)) + bias) for row, bias in zip(weights, biases)]
-        return values[0], values[1], values[2]
+        return _forward_for(self.sizes)(self, inputs)
 
     def copy(self) -> "Network":
         return Network(
