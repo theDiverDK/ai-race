@@ -20,10 +20,15 @@ NEGATIVE = (255, 178, 101)
 def activations(brain, inputs: list[float]) -> list[list[float]]:
     """Return the input and every layer's live outputs."""
     layers = [inputs[:]]
-    for weights, biases in zip(brain.weights, brain.biases):
+    last = len(brain.weights) - 1
+    for index, (weights, biases) in enumerate(zip(brain.weights, brain.biases)):
+        shortcuts = brain.skip if index == last and brain.skip else [[]] * len(biases)
         layers.append([
-            math.tanh(sum(weight * value for weight, value in zip(row, layers[-1])) + bias)
-            for row, bias in zip(weights, biases)
+            math.tanh(
+                sum(weight * value for weight, value in zip(row, layers[-1])) + bias
+                + sum(weight * value for weight, value in zip(shortcut, inputs))
+            )
+            for row, bias, shortcut in zip(weights, biases, shortcuts)
         ])
     return layers
 
@@ -40,6 +45,7 @@ class NetworkInspector:
         self.scroll = 0
         self.mouse = (-1, -1)
         self.positions: list[list[tuple[int, int]]] = []
+        self.sensor_count = 0  # inputs beyond this many are the car's own speed
 
     def close(self) -> None:
         self.renderer = None
@@ -78,7 +84,8 @@ class NetworkInspector:
     def draw(self, race, paused: bool) -> None:
         car = race.best_car
         brain = car.brain
-        inputs = car.sensors or race.track.sense(car.x, car.y, car.angle, brain.sizes[0])
+        self.sensor_count = race.inputs
+        inputs = car.inputs or [0.0] * brain.sizes[0]
         layers = activations(brain, inputs)
         if self.selected and (
             self.selected[0] >= len(layers)
@@ -107,22 +114,23 @@ class NetworkInspector:
                 (x, round(top + (bottom - top) * (i + 0.5) / count))
                 for i in range(count)
             ])
-            name = "Sensors" if layer == 0 else "Outputs" if layer == len(brain.sizes) - 1 else f"Hidden {layer}"
+            name = "Sensors + speed" if layer == 0 else "Outputs" if layer == len(brain.sizes) - 1 else f"Hidden {layer}"
             self._text(name, x - 27, 112, MUTED)
 
         selected = self.selected
+        # Direct input-to-output shortcuts, drawn first so the layers sit on top.
+        output_layer = len(brain.sizes) - 1
+        for target, row in enumerate(brain.skip):
+            for source, weight in enumerate(row):
+                self._link(self.positions[0][source], self.positions[output_layer][target], weight,
+                           selected in ((0, source), (output_layer, target)))
         for layer, matrix in enumerate(brain.weights):
             for target, row in enumerate(matrix):
                 end = self.positions[layer + 1][target]
                 for source, weight in enumerate(row):
                     start = self.positions[layer][source]
                     highlighted = selected in ((layer, source), (layer + 1, target))
-                    intensity = min(abs(weight) / 1.5, 1.0)
-                    base = POSITIVE if weight >= 0 else NEGATIVE
-                    floor = 39 if highlighted else 23
-                    factor = (0.35 if highlighted else 0.15) + intensity * (0.65 if highlighted else 0.45)
-                    color = tuple(round(floor + (component - floor) * factor) for component in base)
-                    pygame.draw.line(self.surface, color, start, end, 2 if highlighted else 1)
+                    self._link(start, end, weight, highlighted)
 
         for layer, points in enumerate(self.positions):
             for index, (x, y) in enumerate(points):
@@ -140,6 +148,14 @@ class NetworkInspector:
         self.renderer.clear()
         self.renderer.blit(texture)
         self.renderer.present()
+
+    def _link(self, start, end, weight: float, highlighted: bool) -> None:
+        intensity = min(abs(weight) / 1.5, 1.0)
+        base = POSITIVE if weight >= 0 else NEGATIVE
+        floor = 39 if highlighted else 23
+        factor = (0.35 if highlighted else 0.15) + intensity * (0.65 if highlighted else 0.45)
+        color = tuple(round(floor + (component - floor) * factor) for component in base)
+        pygame.draw.line(self.surface, color, start, end, 2 if highlighted else 1)
 
     def _draw_details(self, brain, layers: list[list[float]]) -> None:
         x = 829
@@ -162,17 +178,26 @@ class NetworkInspector:
             weighted = sum(
                 w * value for w, value in zip(brain.weights[layer - 1][index], layers[layer - 1])
             )
+            shortcut = brain.skip[index] if layer == len(layers) - 1 and brain.skip else []
+            weighted += sum(w * value for w, value in zip(shortcut, layers[0]))
             self._text(f"Bias: {bias:+.6f}", x, 151)
             self._text(f"Weighted sum + bias: {weighted + bias:+.6f}", x, 173)
             rows.append(("INCOMING CONNECTIONS", ""))
             for source, weight in enumerate(brain.weights[layer - 1][index]):
                 rows.append((f"L{layer - 1}:{source + 1}  →  L{layer}:{index + 1}", f"{weight:+.6f}"))
+            for source, weight in enumerate(shortcut):
+                rows.append((f"L0:{source + 1}  →  L{layer}:{index + 1}  (direct)", f"{weight:+.6f}"))
+        elif index >= self.sensor_count:
+            self._text("Input: the car's own speed (÷ top speed)", x, 151)
         else:
             self._text("Input: normalized road-edge distance", x, 151)
         if layer < len(layers) - 1:
             rows.append(("OUTGOING CONNECTIONS", ""))
             for target, matrix_row in enumerate(brain.weights[layer]):
                 rows.append((f"L{layer}:{index + 1}  →  L{layer + 1}:{target + 1}", f"{matrix_row[index]:+.6f}"))
+            if layer == 0:
+                for target, shortcut_row in enumerate(brain.skip):
+                    rows.append((f"L0:{index + 1}  →  L{len(layers) - 1}:{target + 1}  (direct)", f"{shortcut_row[index]:+.6f}"))
         visible = (SIZE[1] - 234) // 22
         self.scroll = min(self.scroll, max(0, len(rows) - visible))
         for row_index, (label, value) in enumerate(rows[self.scroll:self.scroll + visible]):

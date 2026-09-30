@@ -156,7 +156,7 @@ class RaceTests(unittest.TestCase):
         open_track.on_road.return_value = True
         open_track.progress.return_value = (0.0, 0)
         long_reverse = car_with_controls((0, -1, -1), 0)
-        for _ in range(50):
+        for _ in range(35):  # under the 4 s no-progress limit: reversing is not a stall
             long_reverse.update(open_track, 0.1)
         self.assertEqual(long_reverse.speed, -110)
         self.assertGreater(long_reverse.distance_travelled, 10)
@@ -313,7 +313,7 @@ class RaceTests(unittest.TestCase):
             if car is race.cars[0]:
                 car.laps_completed, car.best_progress, car.fastest_lap = 1, track.length, 5.0
             elif car is race.cars[7]:
-                car.best_progress, car.fastest_lap = track.length * 2, 4.0
+                car.best_progress, car.fastest_lap = track.length * 3, 4.0
         with patch.object(Car, "update", challenger_wins):
             self.finish_heat(race)
         self.assertIsNot(race.champion, champion)
@@ -526,25 +526,58 @@ class RaceTests(unittest.TestCase):
         self.assertIsNone(Track(1, mirror=True)._art)  # not drawn until shown
         self.assertIsNotNone(Track(1, mirror=True).art)
 
-    def test_every_heat_adds_probe_roads_that_differ_from_the_shown_one(self):
-        race = Race(Track(3), 7, [8], max_runtime=5)
-        shown = (3, False, False)
-        seen_levels = set()
+    def test_every_heat_adds_hard_probe_roads_that_differ_from_the_shown_one(self):
+        race = Race(Track(1), 7, [8], max_runtime=5)
+        seen_levels, seen_orientations = set(), set()
         with patch.object(Car, "update", return_value=None):
-            for _ in range(30):
-                self.assertEqual(len(race.probes), 2)
+            for _ in range(60):
                 keys = [(t.level, t.mirror, t.reverse) for t, _ in race.probes]
-                self.assertEqual(keys[0][0], 3)  # the same road, another orientation
-                self.assertNotEqual(keys[0], shown)
-                self.assertNotIn(shown, keys)
+                self.assertEqual(len(keys), 2)
                 self.assertEqual(len(set(keys)), 2)
+                self.assertNotIn((race.track.level, race.track.mirror, race.track.reverse), keys)
+                self.assertTrue(all(level >= 5 for level, _, _ in keys))  # hard roads only
                 self.assertTrue(all(len(cars) == POPULATION for _, cars in race.probes))
-                self.assertTrue(all(level <= 4 for level, _, _ in keys))  # only nearby roads
                 seen_levels.update(level for level, _, _ in keys)
-                self.finish_heat(race)
-                race.change_track(race.track_for(3))  # keep the shown road fixed for this check
-        self.assertEqual(seen_levels, {1, 2, 3, 4})
+                seen_orientations.update(key[1:] for key in keys)
+                race.change_track(race.track_for(1))  # keep the shown road easy
+        self.assertEqual(seen_levels, set(range(5, 12)))
+        self.assertEqual(len(seen_orientations), 4)
 
+    def test_hard_probes_do_not_depend_on_how_far_the_gauntlet_got(self):
+        race = Race(Track(1), 7, [8], max_runtime=5)
+        self.assertGreaterEqual(min(t.level for t, _ in race.probes), 5)
+        self.assertEqual(race.track.level, 1)
+
+    def test_champion_needs_to_be_more_than_twice_as_fit_to_be_replaced(self):
+        race = self.crowned_race()
+        champion = race.champion
+
+        def challenger(factor):
+            def update(car, track, dt):
+                if car is race.cars[0]:
+                    car.best_progress = track.length
+                elif car is race.cars[7]:
+                    car.best_progress = track.length * factor
+            return patch.object(Car, "update", update)
+        with challenger(1.9):
+            self.finish_heat(race)
+        self.assertIs(race.champion, champion)
+        race = self.crowned_race()
+        champion = race.champion
+        with challenger(2.5):
+            self.finish_heat(race)
+        self.assertIsNot(race.champion, champion)
+
+    def test_speed_is_the_last_input_of_every_brain(self):
+        race = Race(Track(1), 7, [8], max_runtime=5)
+        self.assertEqual(race.sizes[0], 8)
+        car = race.cars[0]
+        car.sensor_noise = 0.0
+        car.speed = 110.0
+        car.update(race.track, 1 / 60)
+        self.assertEqual(len(car.sensors), 7)
+        self.assertEqual(len(car.inputs), 8)
+        self.assertAlmostEqual(car.inputs[-1], 110.0 / 220)  # the speed the brain felt this step
     def test_probe_cars_share_the_brains_of_the_shown_cars(self):
         race = Race(Track(1), 7, [8], max_runtime=5)
         for _, cars in race.probes:
@@ -588,18 +621,74 @@ class RaceTests(unittest.TestCase):
                 seen.add((race.track.mirror, race.track.reverse))
         self.assertGreater(len(seen), 2)
 
+    def test_a_car_that_stops_making_progress_is_out_even_if_it_keeps_driving(self):
+        class Cruiser:
+            sizes = (8, 3)
+
+            def forward(self, inputs):
+                return 0.0, 0.3, 0.0
+
+        track = Track(1)
+        car = Car(Cruiser(), *track.points[0], 0.0, sensor_noise=0.0)
+        with patch.object(track, "on_road", return_value=True):
+            with patch.object(track, "progress", return_value=(100.0, 0)):  # stuck at one spot
+                for _ in range(int(3.9 * 60)):
+                    car.update(track, 1 / 60)
+                self.assertTrue(car.alive)
+                for _ in range(int(0.3 * 60)):
+                    car.update(track, 1 / 60)
+        self.assertFalse(car.alive)
+        self.assertGreater(abs(car.speed), 20)  # it was still driving, just going nowhere
+
+    def test_a_car_that_keeps_advancing_is_not_timed_out(self):
+        class Cruiser:
+            sizes = (8, 3)
+
+            def forward(self, inputs):
+                return 0.0, 0.3, 0.0
+
+        track = Track(1)
+        car = Car(Cruiser(), *track.points[0], 0.0, sensor_noise=0.0)
+        distance = {"value": 0.0}
+
+        def advancing(x, y, near):
+            distance["value"] += 1.0  # 60 px per simulated second
+            return distance["value"], 0
+        with patch.object(track, "on_road", return_value=True):
+            with patch.object(track, "progress", side_effect=advancing):
+                for _ in range(10 * 60):
+                    car.update(track, 1 / 60)
+        self.assertTrue(car.alive)
+
+    def test_a_circling_champion_cannot_freeze_the_run(self):
+        race = self.crowned_race()
+
+        def circler(car, track, dt):
+            if car is race.cars[0]:
+                # Alive and "driving" but never gaining ground, like a car going in circles.
+                car.time += dt
+                if car.time - car.mark_time > 4.0:
+                    car.alive = False
+        with patch.object(Car, "update", circler):
+            for _ in range(int(6 / 0.05)):
+                race.update(0.05)
+        self.assertIn("crashed", race.last_result[1])
+
     def test_bad_or_missing_save_files_are_ignored(self):
         self.assertIsNone(load_networks(self.save_path))
         self.save_path.write_text("not json")
         self.assertIsNone(load_networks(self.save_path))
-        self.save_path.write_text('{"version": 2, "tracks_completed": 1, "networks": [{"sizes": [5, 3], "weights": [[[1]]], "biases": [[0, 0, 0]]}]}')
+        self.save_path.write_text('{"version": 2, "tracks_completed": 1, "networks": []}')
+        self.assertIsNone(load_networks(self.save_path))  # older format without the speed input
+        self.save_path.write_text('{"version": 3, "tracks_completed": 1, "networks": [{"sizes": [5, 3], "weights": [[[1]]], "biases": [[0, 0, 0]]}]}')
         self.assertIsNone(load_networks(self.save_path))
 
     def test_app_starts_on_road_one_and_loads_saved_network(self):
-        brains = [Network.random((5, 6, 4, 3), random.Random(i)) for i in range(2)]
+        brains = [Network.random((6, 6, 4, 3), random.Random(i)) for i in range(2)]  # 5 sensors + speed
         save_networks(self.save_path, brains, 7)
         app = App()
         self.assertEqual((app.inputs, app.hidden, app.road_level), (5, [6, 4], 1))
+        self.assertEqual(app.race.sizes, (6, 6, 4, 3))
         self.assertEqual(app.race.record_tracks, 7)
         self.assertEqual(app.race.cars[0].brain.weights, brains[0].weights)
         self.assertEqual(app.race.tracks_completed, 0)

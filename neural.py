@@ -5,17 +5,24 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from operator import mul
 from pathlib import Path
 
 
 WEIGHT_MUTATION_STD = 0.15
 BIAS_MUTATION_STD = 0.10
+WEIGHT_MUTATION_RATE = 0.12
+BIAS_MUTATION_RATE = 0.18
+CROSSOVER_RATE = 0.5  # chance a gene comes from the second parent; 0 = mutated clone
 MINOR_WEIGHT_STD = 0.03
 MINOR_BIAS_STD = 0.02
 MINOR_MUTATION_RATE = 0.10
-SAVE_VERSION = 2
+# Inputs also feed the outputs directly, next to the hidden layers. Simple reflexes
+# such as steering toward the open side or braking when fast with a wall ahead then
+# need a handful of weights instead of a path through two random tanh layers.
+SKIP_CONNECTIONS = True
+SAVE_VERSION = 3  # v3: networks have a speed input
 
 
 @dataclass
@@ -25,6 +32,7 @@ class Network:
     sizes: tuple[int, ...]
     weights: list[list[list[float]]]
     biases: list[list[float]]
+    skip: list[list[float]] = field(default_factory=list)  # outputs x inputs, added before the output tanh
 
     @classmethod
     def random(cls, sizes: tuple[int, ...], rng: random.Random) -> "Network":
@@ -38,17 +46,29 @@ class Network:
             biases.append([rng.gauss(0, 0.25) for _ in range(outputs)])
         # A slight initial preference for forward drive still permits reverse.
         biases[-1][1] += 0.35
-        return cls(sizes, weights, biases)
+        skip_scale = math.sqrt(2.0 / sizes[0])
+        skip = [
+            [rng.gauss(0, skip_scale) if SKIP_CONNECTIONS else 0.0 for _ in range(sizes[0])]
+            for _ in range(sizes[-1])
+        ]
+        return cls(sizes, weights, biases, skip)
 
     def forward(self, inputs: list[float]) -> tuple[float, float, float]:
         if len(inputs) != self.sizes[0]:
             raise ValueError(f"Expected {self.sizes[0]} inputs, got {len(inputs)}")
         values = inputs
         tanh = math.tanh
-        for weights, biases in zip(self.weights, self.biases):
+        last = len(self.weights) - 1
+        for index, (weights, biases) in enumerate(zip(self.weights, self.biases)):
             # sum(map(mul, ...)) is several times faster than a generator here,
             # and this runs for every car on every simulation step.
-            values = [tanh(sum(map(mul, row, values)) + bias) for row, bias in zip(weights, biases)]
+            if index == last and self.skip:
+                values = [
+                    tanh(sum(map(mul, row, values)) + bias + sum(map(mul, shortcut, inputs)))
+                    for row, bias, shortcut in zip(weights, biases, self.skip)
+                ]
+            else:
+                values = [tanh(sum(map(mul, row, values)) + bias) for row, bias in zip(weights, biases)]
         return values[0], values[1], values[2]
 
     def copy(self) -> "Network":
@@ -56,6 +76,7 @@ class Network:
             self.sizes,
             [[row[:] for row in layer] for layer in self.weights],
             [layer[:] for layer in self.biases],
+            [row[:] for row in self.skip],
         )
 
     def minor_mutation(self, rng: random.Random) -> "Network":
@@ -70,22 +91,31 @@ class Network:
             for index, value in enumerate(layer):
                 if rng.random() < MINOR_MUTATION_RATE:
                     layer[index] = value + rng.gauss(0, MINOR_BIAS_STD)
+        if SKIP_CONNECTIONS:
+            for row in clone.skip:
+                for index, value in enumerate(row):
+                    if rng.random() < MINOR_MUTATION_RATE:
+                        row[index] = value + rng.gauss(0, MINOR_WEIGHT_STD)
         return clone
 
     def to_dict(self) -> dict:
-        return {"sizes": list(self.sizes), "weights": self.weights, "biases": self.biases}
+        return {"sizes": list(self.sizes), "weights": self.weights, "biases": self.biases, "skip": self.skip}
 
     @classmethod
     def from_dict(cls, data: dict) -> "Network":
         sizes = tuple(int(size) for size in data["sizes"])
         weights = [[[float(v) for v in row] for row in layer] for layer in data["weights"]]
         biases = [[float(v) for v in layer] for layer in data["biases"]]
+        # Files written before skip connections existed have none: all zeros keeps them identical.
+        skip = [[float(v) for v in row] for row in data.get("skip") or [[0.0] * sizes[0] for _ in range(sizes[-1])]]
         if len(sizes) < 2 or sizes[-1] != 3 or len(weights) != len(sizes) - 1 or len(biases) != len(weights):
             raise ValueError("Malformed network")
         for (inputs, outputs), layer, bias in zip(zip(sizes, sizes[1:]), weights, biases):
             if len(layer) != outputs or len(bias) != outputs or any(len(row) != inputs for row in layer):
                 raise ValueError("Network shape does not match its layer sizes")
-        return cls(sizes, weights, biases)
+        if len(skip) != sizes[-1] or any(len(row) != sizes[0] for row in skip):
+            raise ValueError("Skip connections do not match the layer sizes")
+        return cls(sizes, weights, biases, skip)
 
     def child(self, other: "Network", rng: random.Random) -> "Network":
         if self.sizes != other.sizes:
@@ -94,18 +124,26 @@ class Network:
         for layer_index, layer in enumerate(child.weights):
             for row_index, row in enumerate(layer):
                 for column_index, value in enumerate(row):
-                    if rng.random() < 0.5:
+                    if rng.random() < CROSSOVER_RATE:
                         value = other.weights[layer_index][row_index][column_index]
-                    if rng.random() < 0.12:
+                    if rng.random() < WEIGHT_MUTATION_RATE:
                         value += rng.gauss(0, WEIGHT_MUTATION_STD)
                     row[column_index] = value
         for layer_index, layer in enumerate(child.biases):
             for index, value in enumerate(layer):
-                if rng.random() < 0.5:
+                if rng.random() < CROSSOVER_RATE:
                     value = other.biases[layer_index][index]
-                if rng.random() < 0.18:
+                if rng.random() < BIAS_MUTATION_RATE:
                     value += rng.gauss(0, BIAS_MUTATION_STD)
                 layer[index] = value
+        if SKIP_CONNECTIONS:
+            for row_index, row in enumerate(child.skip):
+                for column_index, value in enumerate(row):
+                    if rng.random() < CROSSOVER_RATE:
+                        value = other.skip[row_index][column_index]
+                    if rng.random() < WEIGHT_MUTATION_RATE:
+                        value += rng.gauss(0, WEIGHT_MUTATION_STD)
+                    row[column_index] = value
         return child
 
 
@@ -186,5 +224,5 @@ def load_networks(path: Path) -> SaveData | None:
             max(0, int(payload["tracks_completed"])),
             max(0.0, float(payload.get("best_score", 0.0))),
         )
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
         return None
