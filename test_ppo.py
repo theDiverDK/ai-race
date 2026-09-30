@@ -66,63 +66,108 @@ class PPOTests(unittest.TestCase):
         resumed = PPORace(Track(1), 7, [8], 5, True, checkpoint, resume=True)
         self.assertEqual(resumed.agent.updates, 1)
 
-    def test_visible_worker_keeps_driving_during_optimization(self):
+    def test_all_workers_keep_driving_during_optimization(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         with patch.object(main, "PPO_ROLLOUT_STEPS", 2):
             race.update(1 / 60)
             race.update(1 / 60)
         self.assertTrue(race.agent.optimizing)
-        car = race.cars[0]
-        old_time = car.time
+        cars = race.cars[:]
+        old_times = [car.time for car in cars]
         race.update(1 / 60)
-        self.assertTrue(race.cars[0] is not car or race.cars[0].time > old_time)
-        self.assertIs(race.cars[0], race.worker_cars[0])
+        self.assertTrue(all(
+            new is not old or new.time > old_time
+            for new, old, old_time in zip(race.cars, cars, old_times)
+        ))
+        self.assertIs(race.cars, race.worker_cars)
 
-    def test_visible_worker_cycles_roads_after_five_episodes(self):
+    def test_all_ppo_cars_share_the_displayed_road_and_five_clean_runs_advance_it(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
-        hidden_cars = race.worker_cars[1:]
-        hidden_tracks = race.worker_tracks[1:]
-        for count in range(1, main.PPO_VISIBLE_EPISODES_PER_ROAD):
-            race.worker_cars[0].time = race.heat_limit
-            race._advance([0], 0.0, collect=False)
-            self.assertEqual(race.track.level, 1)
-            self.assertEqual(race.visible_episodes_on_road, count)
-        race.best_ever = 100.0
-        race.worker_cars[0].time = race.heat_limit
-        race._advance([0], 0.0, collect=True)
+        self.assertEqual(len(race.cars), main.PPO_WORKERS)
+        self.assertIs(race.cars, race.worker_cars)
+        self.assertTrue(all(track is race.track for track in race.worker_tracks))
+        self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars))
+        self.assertGreater(min(
+            main.math.dist((first.x, first.y), (second.x, second.y))
+            for i, first in enumerate(race.cars) for second in race.cars[i + 1:]
+        ), 15)
+        previous_cars = race.cars[:]
+        with patch.object(Car, "move", return_value=None):
+            for count in range(1, main.PPO_CLEAN_RUNS_PER_ROAD):
+                race.worker_cars[count - 1].time = race.heat_limit
+                race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
+                self.assertEqual(race.track.level, 1)
+                self.assertEqual(race.clean_runs_on_road, count)
+            race.best_ever = 100.0
+            race.worker_cars[main.PPO_CLEAN_RUNS_PER_ROAD - 1].time = race.heat_limit
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
         self.assertEqual(race.track.level, 2)
-        self.assertEqual(race.worker_tracks[0].level, 2)
-        self.assertIs(race.cars[0], race.worker_cars[0])
-        self.assertEqual(race.visible_episodes_on_road, 0)
+        self.assertTrue(all(track is race.track for track in race.worker_tracks))
+        self.assertTrue(all(new is not old for new, old in zip(race.cars, previous_cars)))
+        self.assertEqual(race.clean_runs_on_road, 0)
         self.assertEqual(race.best_ever, 0.0)
         self.assertEqual(len(race.rollout), 1)
-        self.assertEqual(race.rollout[0]["dones"][0], 1.0)
-        self.assertEqual(race.worker_cars[1:], hidden_cars)
-        self.assertEqual(race.worker_tracks[1:], hidden_tracks)
+        np.testing.assert_array_equal(race.rollout[0]["dones"], np.ones(main.PPO_WORKERS))
+
+    def test_crashes_and_unlimited_time_do_not_count_as_clean_runs(self):
+        race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
+        race.worker_cars[0].time = race.heat_limit
+        race.worker_cars[0].alive = False
+        race._advance([0], 0.0, collect=False)
+        self.assertEqual(race.clean_runs_on_road, 0)
+        race.time_limit_enabled = False
+        race.worker_cars[0].time = race.heat_limit
+        with patch.object(Car, "move", return_value=None):
+            race._advance([0], 0.0, collect=False)
+        self.assertEqual(race.clean_runs_on_road, 0)
+        self.assertEqual(race.track.level, 1)
+
+    def test_ppo_grid_starts_on_every_road(self):
+        race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
+        for level in range(1, len(main.ROAD_SPECS) + 1):
+            race.change_track(Track(level))
+            self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars), level)
+            self.assertGreater(min(
+                main.math.dist((first.x, first.y), (second.x, second.y))
+                for i, first in enumerate(race.cars) for second in race.cars[i + 1:]
+            ), 15, level)
+            for car in race.cars:
+                before = car.progress
+                for _ in range(10):
+                    car.move(race.track, 1 / 60, (0.0, 0.0, 0.0))
+                self.assertTrue(car.alive, level)
+                self.assertGreater(car.best_progress, before, level)
 
     def test_manual_ppo_road_choice_restarts_count_and_last_road_wraps(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
-        race.worker_cars[0].time = race.heat_limit
-        race._advance([0], 0.0, collect=False)
-        race.change_track(Track(len(main.ROAD_SPECS)))
-        self.assertEqual(race.visible_episodes_on_road, 0)
-        for _ in range(main.PPO_VISIBLE_EPISODES_PER_ROAD):
+        with patch.object(Car, "move", return_value=None):
             race.worker_cars[0].time = race.heat_limit
             race._advance([0], 0.0, collect=False)
+        self.assertEqual(race.clean_runs_on_road, 1)
+        race.change_track(Track(len(main.ROAD_SPECS)))
+        self.assertEqual(race.clean_runs_on_road, 0)
+        self.assertTrue(all(track is race.track for track in race.worker_tracks))
+        with patch.object(Car, "move", return_value=None):
+            for _ in range(main.PPO_CLEAN_RUNS_PER_ROAD):
+                race.worker_cars[0].time = race.heat_limit
+                race._advance([0], 0.0, collect=False)
         self.assertEqual(race.track.level, 1)
-        self.assertEqual(race.visible_episodes_on_road, 0)
+        self.assertEqual(race.clean_runs_on_road, 0)
+        self.assertTrue(all(track is race.track for track in race.worker_tracks))
 
-    def test_app_displays_road_advanced_by_visible_ppo_worker(self):
+    def test_app_displays_road_advanced_by_ppo_cars(self):
         app = App()
         app.handle_action("algorithm")
         app.speed = 1
-        app.race.visible_episodes_on_road = main.PPO_VISIBLE_EPISODES_PER_ROAD - 1
+        app.race.clean_runs_on_road = main.PPO_CLEAN_RUNS_PER_ROAD - 1
         app.race.worker_cars[0].time = app.race.heat_limit
-        with patch("pygame.event.get", side_effect=[[], [pygame.event.Event(pygame.QUIT)]]):
-            app.run()
+        with patch.object(Car, "move", return_value=None):
+            with patch("pygame.event.get", side_effect=[[], [pygame.event.Event(pygame.QUIT)]]):
+                app.run()
         self.assertEqual(app.road_level, 2)
         self.assertIs(app.track, app.race.track)
-        self.assertIs(app.race.cars[0], app.race.worker_cars[0])
+        self.assertIs(app.race.cars, app.race.worker_cars)
+        self.assertTrue(all(track is app.track for track in app.race.worker_tracks))
 
     def test_algorithm_switch_preserves_both_in_memory_trainers(self):
         app = App()
@@ -139,7 +184,8 @@ class PPOTests(unittest.TestCase):
         self.assertIs(app.race, ppo)
         app.handle_action("road:+")
         self.assertEqual(app.track.level, 2)
-        self.assertIs(app.race.cars[0], app.race.worker_cars[0])
+        self.assertIs(app.race.cars, app.race.worker_cars)
+        self.assertTrue(all(track is app.track for track in app.race.worker_tracks))
 
     def test_algorithm_button_switches_mode_in_event_loop(self):
         app = App()

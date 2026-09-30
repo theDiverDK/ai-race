@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -64,7 +65,7 @@ PROBE_COUNT = 2
 PROBE_MIN_LEVEL = 5
 PPO_WORKERS = 8
 PPO_ROLLOUT_STEPS = 256
-PPO_VISIBLE_EPISODES_PER_ROAD = 5
+PPO_CLEAN_RUNS_PER_ROAD = 5
 # A car that does not gain STAGNATION_DISTANCE px of forward progress for
 # STAGNATION_SECONDS is out. Without this, a network can drive in circles (or back
 # and forth) on the road forever: it never crashes, so a champion doing it is never
@@ -707,7 +708,7 @@ class Race:
 
 
 class PPORace:
-    """Train one shared PPO policy on parallel, mostly headless car rollouts."""
+    """Train one shared PPO policy with every worker driving the displayed road."""
 
     algorithm = "ppo"
 
@@ -735,11 +736,11 @@ class PPORace:
         self.worker_cars: list[Car] = []
         self.worker_obs: list[list[float]] = []
         self.worker_returns = [0.0] * PPO_WORKERS
-        self.visible_episodes_on_road = 0
+        self.clean_runs_on_road = 0
         self.cars: list[Car] = []
         for index in range(PPO_WORKERS):
             self._reset_worker(index)
-        self.cars = [self.worker_cars[0]]  # this rollout is drawn while it trains
+        self.cars = self.worker_cars
         self.rollout: list[dict[str, np.ndarray]] = []
         self.generation = self.agent.updates + 1
         self.episodes = 0
@@ -755,31 +756,32 @@ class PPORace:
             self._tracks[key] = Track(*key)
         return self._tracks[key]
 
-    def _new_car(self, track: Track) -> Car:
-        x, y = track.points[0]
-        nx, ny = track.points[1]
+    def _new_car(self, track: Track, index: int) -> Car:
+        # A small two-lane grid makes all eight shared-road rollouts visible.
+        distance = (index // 2) * 28.0
+        segment = bisect_right(track.cumulative, distance) - 1
+        x, y = track.points[segment]
+        nx, ny = track.points[(segment + 1) % track.count]
+        fraction = (distance - track.cumulative[segment]) / track.lengths[segment]
+        x += (nx - x) * fraction
+        y += (ny - y) * fraction
         angle = math.atan2(ny - y, nx - x)
         px, py = -math.sin(angle), math.cos(angle)
-        spread = min(15, track.road_width * 0.18)
-        offset = self.rng.uniform(-spread, spread)
-        return Car(
+        lane = -1 if index % 2 == 0 else 1
+        offset = lane * min(18.0, track.widths[segment] * 0.22) + self.rng.uniform(-2, 2)
+        car = Car(
             self.policy_network, x + px * offset, y + py * offset,
             angle + self.rng.uniform(-START_ANGLE_JITTER, START_ANGLE_JITTER),
         )
+        car.progress = car.best_progress = car.progress_mark = distance
+        car.nearest = segment
+        return car
 
     def _reset_worker(self, index: int, track: Track | None = None) -> None:
         if track is None:
-            if index == 0:
-                track = self.track
-            else:
-                # Unlock harder roads as the policy starts to learn. The visible
-                # worker cycles through every road after a few episodes.
-                unlocked = min(len(ROAD_SPECS), 5 + self.agent.updates // 5)
-                level = self.rng.randint(1, unlocked)
-                mirror, reverse = self.rng.choice(ORIENTATIONS)
-                track = self.track_for(level, mirror, reverse)
+            track = self.track
         self.worker_tracks[index] = track
-        car = self._new_car(track)
+        car = self._new_car(track, index)
         observation = car.observe(track)
         if index < len(self.worker_cars):
             self.worker_cars[index] = car
@@ -788,8 +790,6 @@ class PPORace:
             self.worker_cars.append(car)
             self.worker_obs.append(observation)
         self.worker_returns[index] = 0.0
-        if index == 0:
-            self.cars = [car]
 
     @property
     def heat_limit(self) -> int:
@@ -797,11 +797,12 @@ class PPORace:
 
     @property
     def leader(self) -> Car | None:
-        return self.cars[0] if self.cars[0].alive else None
+        living = [car for car in self.cars if car.alive]
+        return max(living, key=lambda car: car.rank_key) if living else None
 
     @property
     def best_car(self) -> Car:
-        return self.cars[0]
+        return self.leader or max(self.cars, key=lambda car: car.rank_key)
 
     @property
     def mean_reward(self) -> float:
@@ -815,6 +816,7 @@ class PPORace:
         dones = np.zeros(len(indices), dtype=np.float32)
         terminated = np.zeros(len(indices), dtype=bool)
         post_observations = np.zeros_like(observations)
+        clean_finishes = 0
         for row, index in enumerate(indices):
             car, track = self.worker_cars[index], self.worker_tracks[index]
             before_progress, before_laps = car.progress, car.laps_completed
@@ -829,32 +831,40 @@ class PPORace:
             limit = max(FINAL_ROAD_RUNTIME, self.max_runtime) if track.level == len(ROAD_SPECS) else self.max_runtime
             done = not car.alive or (self.time_limit_enabled and car.time >= limit)
             dones[row] = float(done)
+            if done and car.alive:
+                clean_finishes += 1
             self.worker_returns[index] += float(rewards[row])
-            if index == 0:
-                self.best_ever = max(self.best_ever, car.best_progress)
-                if car.fastest_lap is not None:
-                    self.fastest_ever = (
-                        car.fastest_lap if self.fastest_ever is None
-                        else min(self.fastest_ever, car.fastest_lap)
-                    )
+            self.best_ever = max(self.best_ever, car.best_progress)
+            if car.fastest_lap is not None:
+                self.fastest_ever = (
+                    car.fastest_lap if self.fastest_ever is None
+                    else min(self.fastest_ever, car.fastest_lap)
+                )
         next_values = self.agent.value(post_observations)
         next_values[terminated] = 0.0
+        self.clean_runs_on_road += clean_finishes
+        switch_road = self.clean_runs_on_road >= PPO_CLEAN_RUNS_PER_ROAD
+        if switch_road:
+            # End every rollout together before changing roads. Living cars are
+            # truncated and keep their bootstrap values for PPO training.
+            dones[:] = 1.0
         for row, index in enumerate(indices):
             if dones[row]:
                 self.recent_returns.append(self.worker_returns[index])
                 self.recent_returns = self.recent_returns[-40:]
                 self.episodes += 1
-                if index == 0:
-                    self.visible_episodes_on_road += 1
-                    if self.visible_episodes_on_road >= PPO_VISIBLE_EPISODES_PER_ROAD:
-                        next_level = self.track.level % len(ROAD_SPECS) + 1
-                        self.track = self.track_for(next_level, False, False)
-                        self.visible_episodes_on_road = 0
-                        self.best_ever = 0.0
-                        self.fastest_ever = None
-                self._reset_worker(index)
+                if not switch_road:
+                    self._reset_worker(index)
             else:
                 self.worker_obs[index] = post_observations[row].tolist()
+        if switch_road:
+            next_level = self.track.level % len(ROAD_SPECS) + 1
+            self.track = self.track_for(next_level, False, False)
+            self.clean_runs_on_road = 0
+            self.best_ever = 0.0
+            self.fastest_ever = None
+            for index in range(PPO_WORKERS):
+                self._reset_worker(index)
         if collect:
             self.rollout.append({
                 "observations": observations,
@@ -869,8 +879,8 @@ class PPORace:
 
     def update(self, dt: float) -> None:
         if self.agent.optimizing:
-            # Keep the visible training car moving while gradients are applied.
-            self._advance([0], dt, collect=False)
+            # Keep all visible cars moving while gradients are applied.
+            self._advance(list(range(PPO_WORKERS)), dt, collect=False)
             if self.agent.train_minibatch():
                 self.policy_network = self.agent.export_network()
                 for car in self.worker_cars:
@@ -893,9 +903,10 @@ class PPORace:
         self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
         self.fastest_ever = None
-        self.visible_episodes_on_road = 0
+        self.clean_runs_on_road = 0
         self.rollout.clear()
-        self._reset_worker(0, track)
+        for index in range(PPO_WORKERS):
+            self._reset_worker(index, track)
         self.elapsed = 0.0
 
     def save_now(self) -> None:
@@ -1080,13 +1091,14 @@ class App:
         self.screen.blit(self.track.art, (0, 0))
         self.draw_cars()
         hud_height = 118 if self.algorithm == "ppo" else 196
-        pygame.draw.rect(self.screen, (11, 22, 30), (22, 22, 233, hud_height), border_radius=12)
-        self.label("NEURAL CIRCUIT", 37, 32, ACCENT, self.small)
+        hud_x = WORLD_W - 255 if self.algorithm == "ppo" else 22
+        pygame.draw.rect(self.screen, (11, 22, 30), (hud_x, 22, 233, hud_height), border_radius=12)
+        self.label("NEURAL CIRCUIT", hud_x + 15, 32, ACCENT, self.small)
         if self.algorithm == "ppo":
-            self.label(f"PPO update {self.race.agent.updates:03d}", 37, 56, TEXT, self.bold)
-            self.label("Worker 1 of 8 is driving here", 38, 84, MUTED, self.small)
-            self.label(f"Episodes: {self.race.episodes}", 37, 108, ACCENT, self.font)
-            lines = [*(self.race.last_result or ()), "The visible car is a live PPO training rollout."]
+            self.label(f"PPO update {self.race.agent.updates:03d}", hud_x + 15, 56, TEXT, self.bold)
+            self.label(f"{sum(car.alive for car in self.race.cars)}/{PPO_WORKERS} PPO cars on this road", hud_x + 16, 84, MUTED, self.small)
+            self.label(f"Episodes: {self.race.episodes}", hud_x + 15, 108, ACCENT, self.font)
+            lines = [*(self.race.last_result or ()), "All visible cars contribute to PPO training."]
         else:
             self.label(f"Generation {self.race.generation:02d}", 37, 56, TEXT, self.bold)
             alive = sum(car.alive for car in self.race.cars)
@@ -1153,9 +1165,9 @@ class App:
         self.screen.blit(road_name, road_name.get_rect(center=(x + 180, 345)))
         if self.algorithm == "ppo":
             auto_text = (
-                f"Visible road: {self.race.visible_episodes_on_road}/"
-                f"{PPO_VISIBLE_EPISODES_PER_ROAD} runs  •  7 hidden workers"
-            )
+                f"Clean runs: {self.race.clean_runs_on_road}/"
+                f"{PPO_CLEAN_RUNS_PER_ROAD} to next road"
+            ) if self.time_limit_enabled else "Limit off: select roads manually"
         else:
             auto_text = (
                 f"Tracks completed: {self.race.tracks_completed}  •  "

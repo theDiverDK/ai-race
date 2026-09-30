@@ -22,7 +22,7 @@ python main.py
 | **Algorithm** | Switch between **Evolution** and **PPO**. Each mode keeps its in-memory training state while you use the other mode. Evolution saves `best_network.json`; PPO saves `ppo_checkpoint.pt`. |
 | Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks, and restarts the gauntlet there. |
 | Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
-| **Limit On / Limit Off** | Turn the time limit on or off. With it off, the heat continues until every car has left the road, stalled or stopped making progress. |
+| **Limit On / Limit Off** | Turn the time limit on or off. In Evolution, a heat then continues until every car has crashed or stalled. In PPO, each car restarts after a crash, and automatic road progression waits until the limit is enabled. |
 | Input neurons, hidden layers, layer widths | Change the network design. Click **Apply & Restart** to start a new population with those settings. The output layer always has three neurons. |
 | **Pause** / `P` | Pause or resume. |
 | **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Starts at 4×. |
@@ -34,9 +34,9 @@ python main.py
 
 ### PPO
 
-PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel. **The car on screen is worker 1 and is actually contributing to training**; the other seven drive on roads that are simulated without drawing them. The visible worker advances to the next road after five completed runs, cycling through all 11 roads. Choosing a road in the UI starts a fresh five-run count there. Other workers sample roads and orientations from a curriculum that unlocks harder roads as training proceeds.
+PPO trains one shared actor-critic network with backpropagation. Eight cars collect driving experience in parallel, all on the displayed road. Each car samples its own controls, and all eight are visible and contribute to training. A run counts as clean only when a car reaches the enabled time limit while still driving. After five clean runs across the group, all eight cars move to the next road together, cycling through all 11 roads. Crashes do not advance the road counter. Choosing a road in the UI resets the count and moves the whole group there. With the time limit disabled, runs continue until a car crashes, so the road stays selected until the limit is enabled or you choose another road.
 
-Each step rewards forward progress, gives a small lap bonus, and penalizes crashes and wasted time. After 256 steps per worker, PPO computes generalized advantage estimates and performs four epochs of clipped policy updates in small batches. Optimization is spread over UI frames; the visible car continues driving while it runs. The network architecture controls also apply to PPO. Switching away pauses its trainer, and returning resumes it. **Apply & Restart** starts a fresh policy for the selected mode.
+Each step rewards forward progress, gives a small lap bonus, and penalizes crashes and wasted time. After 256 steps per worker, PPO computes generalized advantage estimates and performs four epochs of clipped policy updates in small batches. Optimization is spread over UI frames; all eight cars continue driving while it runs. The network architecture controls also apply to PPO. Switching away pauses its trainer, and returning resumes it. **Apply & Restart** starts a fresh policy for the selected mode.
 
 PPO checkpoints are saved separately to `ppo_checkpoint.pt` (git-ignored), periodically and on exit. A matching checkpoint loads when PPO is first selected after startup. The PPO display shows update count, episodes, best distance on the visible road, and mean episode reward. Rewards are training feedback; they are not the evolutionary run score.
 
