@@ -215,6 +215,17 @@ class Track:
             self.cumulative.append(self.cumulative[-1] + length)
         self.length = self.cumulative[-1]
 
+        segments = []
+        for i, (ax, ay) in enumerate(self.points):
+            bx, by = self.points[(i + 1) % self.count]
+            vx, vy = bx - ax, by - ay
+            segments.append((i, ax, ay, vx, vy, vx * vx + vy * vy,
+                             self.cumulative[i], self.lengths[i]))
+        self._progress_windows = [
+            tuple(segments[(near + offset) % self.count] for offset in range(-8, 9))
+            for near in range(self.count)
+        ]
+
         road_alpha = pygame.Surface((WORLD_W, HEIGHT), pygame.SRCALPHA)
         draw_road_band(road_alpha, self.points, self.widths, (255, 255, 255))
         self.mask = pygame.mask.from_surface(road_alpha)
@@ -259,17 +270,12 @@ class Track:
         best_distance = float("inf")
         best_progress = 0.0
         best_index = near
-        for offset in range(-8, 9):
-            i = (near + offset) % self.count
-            ax, ay = self.points[i]
-            bx, by = self.points[(i + 1) % self.count]
-            vx, vy = bx - ax, by - ay
-            segment_squared = vx * vx + vy * vy
+        for i, ax, ay, vx, vy, segment_squared, start, length in self._progress_windows[near]:
             t = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / segment_squared))
             distance = (x - ax - t * vx) ** 2 + (y - ay - t * vy) ** 2
             if distance < best_distance:
                 best_distance = distance
-                best_progress = self.cumulative[i] + t * self.lengths[i]
+                best_progress = start + t * length
                 best_index = i
         return best_progress, best_index
 
