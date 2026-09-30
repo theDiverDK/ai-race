@@ -50,15 +50,13 @@ The best car (the *champion*) always sits in slot 0 of each generation, unchange
 
 The counter resets to 0 and training restarts on Road 1 whenever the champion crashes (leaves the road, stalls, or goes 4 seconds without gaining 30 px of forward progress) or another car is clearly fitter: more than twice its fitness (see below). The best car of that generation becomes the new champion. Jumping to another road with the road arrows also resets the counter and starts the gauntlet from that road.
 
-### Learning to drive, not to remember a road
+### Training on the displayed road
 
-A network that only fits one road, or one direction of it, would look good in a single race and then fail elsewhere. Three things prevent that:
+All 50 evolutionary cars drive only the road you see. Selection compares the distance each car reaches on that road, scaled by the heat limit. A challenger replaces the champion only when its fitness is more than twice the champion's. This margin prevents frequent takeovers from resetting the gauntlet.
 
-- **Probe roads.** In every heat each network also drives two hidden probe roads at the same time, each with its own random start. They are always hard roads (Roads 5 to 11) in a random orientation, whichever road the gauntlet is on. Probe roads are simulated, not drawn; the note at the bottom left lists them. Hard roads have to shape the population from the first generation: training on easy roads first teaches a network to drive flat out everywhere, and it then dies at the first tight bend of the hard roads.
-- **Mirrored and reversed roads.** Every road exists in four orientations: original, mirrored (left turns become right turns), reversed (driven the other way round) and both. A network that just leans one way cannot pass all four. After Road 11 the shown road is random in road and orientation too.
-- **Fitness across all roads.** Selection uses `0.5 × average + 0.5 × worst` of the distance driven on the shown road and both probe roads, scaled to the same units on every road. A specialist that is brilliant on one road and crashes on the others loses to an all-rounder. The champion's 5-lap gauntlet on 11 different roads is the final exam. A challenger only replaces the champion when its fitness is more than twice the champion's: fitness is noisy and the population keeps improving, and a small margin turned nearly every heat into a takeover that reset the run.
+The gauntlet moves the displayed road forward as the champion completes it. After Road 11, the displayed road and its orientation vary randomly. Each road can be mirrored and reversed, but cars drive those variants only when one is shown.
 
-Sensor readings also carry a little noise, and cars start with a small random heading and offset.
+Sensor readings also carry a little noise, and cars start with a small random heading and offset. Training on one road at a time can produce drivers that specialize in the current road.
 
 ### Cars that go nowhere
 

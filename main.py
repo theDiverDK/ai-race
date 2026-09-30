@@ -44,10 +44,6 @@ HOW_MADE = {
     "child": "a bred child of two top cars (crossover + mutation)",
     "newcomer": "a brand-new random network",
 }
-# Selection fitness. Every brain also drives probe roads (other orientations of
-# the same road, plus a nearby road) in the same heat, and is judged on its
-# distance there too, so it cannot win by learning one road or one direction.
-FITNESS_MEAN_WEIGHT = 0.5  # the rest goes to the worst road, so weak spots hurt
 REFERENCE_SPEED = 0.5 * 220.0  # px/s used to scale distance to about 0..1
 ORIENTATIONS = [(False, False), (True, False), (False, True), (True, True)]
 ORIENTATION_NAMES = {
@@ -57,13 +53,6 @@ ORIENTATION_NAMES = {
 # The brain also feels its own speed (signed, scaled by top speed): without it
 # a network cannot tell how hard to brake for a bend it is approaching.
 EXTRA_INPUTS = 1
-# Every brain also drives PROBE_COUNT probe roads per heat. They are drawn from the
-# hard roads (PROBE_MIN_LEVEL and up) in any orientation, whatever road the gauntlet
-# is on. Training only on easy roads first teaches "always full speed"; measured over
-# an hour of training, hard probes from the start lift the average share of a lap a
-# champion drives on 22 test roads from about 14.5 to about 19.
-PROBE_COUNT = 2
-PROBE_MIN_LEVEL = 5
 PPO_WORKERS = 8
 PPO_ROLLOUT_STEPS = 256
 PPO_CLEAN_RUNS_PER_ROAD = 5
@@ -245,7 +234,7 @@ class Track:
 
     @property
     def art(self) -> pygame.Surface:
-        """Drawn on first use: probe roads are only driven, never shown."""
+        """Draw the road art only when this road is shown."""
         if self._art is None:
             self._art = self._make_art()
         return self._art
@@ -487,7 +476,6 @@ class Race:
         self.roles_known = bool(seed_networks)
         self.last_result: tuple[str, str] | None = None  # who won the previous generation
         self._tracks = {(track.level, track.mirror, track.reverse): track}
-        self.probes: list[tuple[Track, list[Car]]] = []
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
             brains = next_generation(ranked, self.rng, POPULATION)
@@ -511,19 +499,7 @@ class Race:
 
     def _spawn(self, brains: list[Network]) -> None:
         self.cars = self._make_cars(self.track, brains)
-        self.probes = [(track, self._make_cars(track, brains)) for track in self._choose_probes()]
         self.elapsed = 0.0
-
-    def _choose_probes(self) -> list[Track]:
-        """Hard roads, in random orientations, that every car also drives this heat."""
-        current = (self.track.level, self.track.mirror, self.track.reverse)
-        low = min(PROBE_MIN_LEVEL, len(ROAD_SPECS))
-        picks: list[tuple[int, bool, bool]] = []
-        while len(picks) < PROBE_COUNT:
-            other = (self.rng.randint(low, len(ROAD_SPECS)), *self.rng.choice(ORIENTATIONS))
-            if other != current and other not in picks:
-                picks.append(other)
-        return [self.track_for(*pick) for pick in picks]
 
     def track_for(self, level: int, mirror: bool = False, reverse: bool = False) -> Track:
         key = (level, mirror, reverse)
@@ -532,16 +508,8 @@ class Race:
         return self._tracks[key]
 
     def fitness(self, index: int) -> float:
-        """How well brain `index` drove the shown road and every probe road.
-
-        Distance is scaled to the same units on every road. The score blends the
-        average with the worst road, so a brain must cope with all of them.
-        """
-        reference = REFERENCE_SPEED * self.heat_limit
-        values = [self.cars[index].best_progress / reference]
-        values += [cars[index].best_progress / reference for _, cars in self.probes]
-        mean = sum(values) / len(values)
-        return FITNESS_MEAN_WEIGHT * mean + (1 - FITNESS_MEAN_WEIGHT) * min(values)
+        """Scale a car's best distance on the displayed road for selection."""
+        return self.cars[index].best_progress / (REFERENCE_SPEED * self.heat_limit)
 
     @property
     def laps_required(self) -> int:
@@ -614,9 +582,6 @@ class Race:
         self.elapsed += dt
         for car in self.cars:
             car.update(self.track, dt)
-        for track, cars in self.probes:
-            for car in cars:
-                car.update(track, dt)
         self.best_ever = max(self.best_ever, *(car.best_progress for car in self.cars))
         for car in self.cars:
             if car.fastest_lap is not None:
@@ -631,9 +596,7 @@ class Race:
             self.record_brain = self.scoring_car.brain
         goal = self.champion is not None and self.champion_laps >= self.laps_required
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
-        anyone_alive = any(car.alive for car in self.cars) or any(
-            car.alive for _, cars in self.probes for car in cars
-        )
+        anyone_alive = any(car.alive for car in self.cars)
         if goal or time_expired or not anyone_alive:
             self._end_heat(goal)
 
@@ -658,7 +621,7 @@ class Race:
             outcome = "It is the first champion; the run starts on road 1."
         else:
             crashed = not champion_car.alive and not goal
-            # A challenger must be clearly fitter over all roads to take the title.
+            # A challenger must be clearly fitter on this road to take the title.
             beaten = fitness[winner_index] > fitness[0] * (1 + BEAT_MARGIN) and winner_index != 0
             if crashed or beaten:
                 # Crash, or a clearly better car: new champion, back to road 1.
@@ -1161,8 +1124,7 @@ class App:
             self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), hud_x + 16, 133, MUTED, self.small)
             self.label(f"Run score: {self.race.current_score:,.0f}", hud_x + 15, 160, ORANGE, self.font)
             self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", hud_x + 16, 186, MUTED, self.small)
-            probes = ", ".join(track.label for track, _ in self.race.probes)
-            lines = [*(self.race.last_result or ()), f"Every car is also tested on: {probes}"]
+            lines = [*(self.race.last_result or ()), "All cars train on the displayed road."]
         top = HEIGHT - 66 - 21 * len(lines)
         pygame.draw.rect(self.screen, (11, 22, 30), (22, top - 6, 640, 21 * len(lines) + 10), border_radius=8)
         for row, line in enumerate(lines):

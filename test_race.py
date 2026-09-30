@@ -209,9 +209,6 @@ class RaceTests(unittest.TestCase):
         race = Race(Track(1), 7, [8], max_runtime=5, time_limit_enabled=False)
         for car in race.cars[1:]:
             car.alive = False
-        for _, probe_cars in race.probes:
-            for car in probe_cars:
-                car.alive = False
         with patch.object(Car, "update", return_value=None):
             race.update(6)
             self.assertEqual(race.generation, 1)
@@ -526,27 +523,12 @@ class RaceTests(unittest.TestCase):
         self.assertIsNone(Track(1, mirror=True)._art)  # not drawn until shown
         self.assertIsNotNone(Track(1, mirror=True).art)
 
-    def test_every_heat_adds_hard_probe_roads_that_differ_from_the_shown_one(self):
+    def test_only_visible_cars_drive_the_displayed_road(self):
         race = Race(Track(1), 7, [8], max_runtime=5)
-        seen_levels, seen_orientations = set(), set()
-        with patch.object(Car, "update", return_value=None):
-            for _ in range(60):
-                keys = [(t.level, t.mirror, t.reverse) for t, _ in race.probes]
-                self.assertEqual(len(keys), 2)
-                self.assertEqual(len(set(keys)), 2)
-                self.assertNotIn((race.track.level, race.track.mirror, race.track.reverse), keys)
-                self.assertTrue(all(level >= 5 for level, _, _ in keys))  # hard roads only
-                self.assertTrue(all(len(cars) == POPULATION for _, cars in race.probes))
-                seen_levels.update(level for level, _, _ in keys)
-                seen_orientations.update(key[1:] for key in keys)
-                race.change_track(race.track_for(1))  # keep the shown road easy
-        self.assertEqual(seen_levels, set(range(5, 12)))
-        self.assertEqual(len(seen_orientations), 4)
-
-    def test_hard_probes_do_not_depend_on_how_far_the_gauntlet_got(self):
-        race = Race(Track(1), 7, [8], max_runtime=5)
-        self.assertGreaterEqual(min(t.level for t, _ in race.probes), 5)
-        self.assertEqual(race.track.level, 1)
+        with patch.object(Car, "update", autospec=True) as update:
+            race.update(1 / 60)
+        self.assertEqual(update.call_count, POPULATION)
+        self.assertTrue(all(call.args[1] is race.track for call in update.call_args_list))
 
     def test_champion_needs_to_be_more_than_twice_as_fit_to_be_replaced(self):
         race = self.crowned_race()
@@ -578,38 +560,30 @@ class RaceTests(unittest.TestCase):
         self.assertEqual(len(car.sensors), 7)
         self.assertEqual(len(car.inputs), 8)
         self.assertAlmostEqual(car.inputs[-1], 110.0 / 220)  # the speed the brain felt this step
-    def test_probe_cars_share_the_brains_of_the_shown_cars(self):
-        race = Race(Track(1), 7, [8], max_runtime=5)
-        for _, cars in race.probes:
-            self.assertTrue(all(p.brain is c.brain for p, c in zip(cars, race.cars)))
 
-    def test_fitness_needs_every_road_not_just_the_shown_one(self):
+    def test_fitness_uses_only_distance_on_the_displayed_road(self):
         race = Race(Track(1), 7, [8], max_runtime=5)
         reference = 110.0 * race.heat_limit
-        specialist, all_rounder = race.cars[0], race.cars[1]
-        specialist.best_progress = reference * 3          # great on the shown road only
-        for _, cars in race.probes:
-            cars[0].best_progress = 0
-            cars[1].best_progress = reference * 1.0       # decent everywhere
-        all_rounder.best_progress = reference * 1.0
-        self.assertGreater(race.fitness(1), race.fitness(0))
+        race.cars[0].best_progress = reference * 3
+        race.cars[1].best_progress = reference
+        self.assertGreater(race.fitness(0), race.fitness(1))
         self.assertAlmostEqual(race.fitness(1), 1.0)
-        self.assertAlmostEqual(race.fitness(0), 0.5 * (3 / 3) + 0.0)  # mean 1.0, min 0
+        self.assertAlmostEqual(race.fitness(0), 3.0)
 
-    def test_next_generation_breeds_from_the_best_all_round_driver(self):
+    def test_next_generation_breeds_from_the_best_shown_road_driver(self):
         race = self.crowned_race()
         reference = 110.0 * race.heat_limit
         champion = race.champion
 
-        def all_rounder_is_car_9(car, track, dt):
-            if car in race.cars and car is race.cars[0]:
+        def winner_is_car_9(car, track, dt):
+            if car is race.cars[0]:
+                car.best_progress = reference
+            elif car is race.cars[9]:
                 car.best_progress = reference * 3
-            elif car.brain is race.cars[9].brain:
-                car.best_progress = reference * 2
-        with patch.object(Car, "update", all_rounder_is_car_9):
+        with patch.object(Car, "update", winner_is_car_9):
             self.finish_heat(race)
         self.assertIs(race.champion, race.cars[0].brain)
-        self.assertIsNot(race.champion, champion)  # fitter across roads: took the title
+        self.assertIsNot(race.champion, champion)
 
     def test_random_phase_shows_random_orientations(self):
         race = self.crowned_race()
