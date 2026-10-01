@@ -82,25 +82,31 @@ class PPOTests(unittest.TestCase):
         ))
         self.assertIs(race.cars, race.worker_cars)
 
-    def test_all_ppo_cars_share_the_displayed_road_and_five_clean_runs_advance_it(self):
+    def test_all_ppo_cars_share_the_displayed_road_and_five_lap_runs_advance_it(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         self.assertEqual(len(race.cars), main.PPO_WORKERS)
         self.assertIs(race.cars, race.worker_cars)
         self.assertTrue(all(track is race.track for track in race.worker_tracks))
         self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars))
+        self.assertTrue(all(car.progress == 0 for car in race.cars))
+        start = race.track.points[0]
+        forward = tuple(end - begin for begin, end in zip(start, race.track.points[1]))
+        self.assertTrue(all(abs((car.x - start[0]) * forward[0] + (car.y - start[1]) * forward[1]) < 1e-6 for car in race.cars))
         self.assertGreater(min(
             main.math.dist((first.x, first.y), (second.x, second.y))
             for i, first in enumerate(race.cars) for second in race.cars[i + 1:]
-        ), 15)
+        ), 4)
         previous_cars = race.cars[:]
         with patch.object(Car, "move", return_value=None):
             for count in range(1, main.PPO_CLEAN_RUNS_PER_ROAD):
-                race.worker_cars[count - 1].time = race.heat_limit
+                race.worker_cars[0].laps_completed = 5
+                race.worker_cars[0].progress = race.track.length * 5
                 race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
                 self.assertEqual(race.track.level, 1)
                 self.assertEqual(race.clean_runs_on_road, count)
             race.best_ever = 100.0
-            race.worker_cars[main.PPO_CLEAN_RUNS_PER_ROAD - 1].time = race.heat_limit
+            race.worker_cars[0].laps_completed = 5
+            race.worker_cars[0].progress = race.track.length * 5
             race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
         self.assertEqual(race.track.level, 2)
         self.assertTrue(all(track is race.track for track in race.worker_tracks))
@@ -110,12 +116,13 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(len(race.rollout), 1)
         np.testing.assert_array_equal(race.rollout[0]["dones"], np.ones(main.PPO_WORKERS))
 
-    def test_simultaneous_ppo_finishes_count_as_one_clean_run(self):
+    def test_simultaneous_five_lap_finishes_count_as_one_clean_run(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         with patch.object(Car, "move", return_value=None):
             for count in range(1, main.PPO_CLEAN_RUNS_PER_ROAD + 1):
                 for car in race.cars:
-                    car.time = race.heat_limit
+                    car.laps_completed = 5
+                    car.progress = race.track.length * 5
                 race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
                 self.assertEqual(race.clean_runs_on_road, count % main.PPO_CLEAN_RUNS_PER_ROAD)
                 self.assertEqual(race.track.level, 1 if count < main.PPO_CLEAN_RUNS_PER_ROAD else 2)
@@ -143,28 +150,65 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(payload["race"]["ppo_updates"], app.race.agent.updates)
         self.assertEqual(len(payload["cars"]), main.PPO_WORKERS)
 
-    def test_crashes_and_unlimited_time_do_not_count_as_clean_runs(self):
+    def test_crashed_cars_stay_out_until_all_crash_or_the_leader_finishes_five_laps(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
-        race.worker_cars[0].time = race.heat_limit
-        race.worker_cars[0].alive = False
-        race._advance([0], 0.0, collect=False)
+        first = race.cars[0]
+        cars = race.cars[:]
+        def crash_first(car, track, dt, controls):
+            if car is first:
+                car.alive = False
+        with patch.object(Car, "move", crash_first):
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
+        self.assertIs(race.cars[0], first)
+        self.assertFalse(first.alive)
+        self.assertEqual(race.generation, 1)
+        self.assertEqual(race.episodes, 1)
         self.assertEqual(race.clean_runs_on_road, 0)
-        race.time_limit_enabled = False
-        race.worker_cars[0].time = race.heat_limit
+        race.cars[1].time = 100
         with patch.object(Car, "move", return_value=None):
-            race._advance([0], 0.0, collect=False)
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
+        self.assertEqual(race.generation, 1)
+        self.assertTrue(all(new is old for new, old in zip(race.cars, cars)))
+        self.assertEqual(race.episodes, 1)
+        self.assertEqual(race.rollout[-1]["valid"].sum(), main.PPO_WORKERS - 1)
+        race.agent.begin_update(race.rollout)
+        self.assertEqual(race.agent._data["observations"].shape[0], 2 * main.PPO_WORKERS - 1)
+        while race.agent.optimizing:
+            race.agent.train_minibatch()
+        self.assertEqual(race.agent.updates, 1)
+        def crash_remaining(car, track, dt, controls):
+            car.alive = False
+        with patch.object(Car, "move", crash_remaining):
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
+        self.assertEqual(race.generation, 2)
+        self.assertTrue(all(new is not old for new, old in zip(race.cars, cars)))
+        self.assertEqual(race.episodes, main.PPO_WORKERS)
         self.assertEqual(race.clean_runs_on_road, 0)
         self.assertEqual(race.track.level, 1)
+
+    def test_green_ppo_car_is_the_living_car_physically_ahead(self):
+        race = PPORace(Track(1), 7, [8], 5, False, self.directory / "ppo_checkpoint.pt", resume=False)
+        race.cars[0].progress = 200
+        race.cars[0].best_progress = 500
+        race.cars[1].progress = 250
+        race.cars[1].best_progress = 300
+        self.assertIs(race.leader, race.cars[1])
+        race.cars[1].alive = False
+        self.assertIs(race.leader, race.cars[0])
 
     def test_ppo_grid_starts_on_every_road(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         for level in range(1, len(main.ROAD_SPECS) + 1):
             race.change_track(Track(level))
             self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars), level)
+            self.assertTrue(all(car.progress == 0 for car in race.cars), level)
+            start = race.track.points[0]
+            forward = tuple(end - begin for begin, end in zip(start, race.track.points[1]))
+            self.assertTrue(all(abs((car.x - start[0]) * forward[0] + (car.y - start[1]) * forward[1]) < 1e-6 for car in race.cars), level)
             self.assertGreater(min(
                 main.math.dist((first.x, first.y), (second.x, second.y))
                 for i, first in enumerate(race.cars) for second in race.cars[i + 1:]
-            ), 15, level)
+            ), 4, level)
             for car in race.cars:
                 before = car.progress
                 for _ in range(10):
@@ -175,16 +219,18 @@ class PPOTests(unittest.TestCase):
     def test_manual_ppo_road_choice_restarts_count_and_last_road_wraps(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         with patch.object(Car, "move", return_value=None):
-            race.worker_cars[0].time = race.heat_limit
-            race._advance([0], 0.0, collect=False)
+            race.worker_cars[0].laps_completed = 5
+            race.worker_cars[0].progress = race.track.length * 5
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
         self.assertEqual(race.clean_runs_on_road, 1)
         race.change_track(Track(len(main.ROAD_SPECS)))
         self.assertEqual(race.clean_runs_on_road, 0)
         self.assertTrue(all(track is race.track for track in race.worker_tracks))
         with patch.object(Car, "move", return_value=None):
             for _ in range(main.PPO_CLEAN_RUNS_PER_ROAD):
-                race.worker_cars[0].time = race.heat_limit
-                race._advance([0], 0.0, collect=False)
+                race.worker_cars[0].laps_completed = 5
+                race.worker_cars[0].progress = race.track.length * 5
+                race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
         self.assertEqual(race.track.level, 1)
         self.assertEqual(race.clean_runs_on_road, 0)
         self.assertTrue(all(track is race.track for track in race.worker_tracks))
@@ -194,7 +240,8 @@ class PPOTests(unittest.TestCase):
         app.handle_action("algorithm:ppo")
         app.speed = 1
         app.race.clean_runs_on_road = main.PPO_CLEAN_RUNS_PER_ROAD - 1
-        app.race.worker_cars[0].time = app.race.heat_limit
+        app.race.worker_cars[0].laps_completed = 5
+        app.race.worker_cars[0].progress = app.race.track.length * 5
         with patch.object(Car, "move", return_value=None):
             with patch("pygame.event.get", side_effect=[[], [pygame.event.Event(pygame.QUIT)]]):
                 app.run()
@@ -209,11 +256,14 @@ class PPOTests(unittest.TestCase):
         app.handle_action("algorithm:ppo")
         self.assertEqual(app.algorithm, "ppo")
         ppo = app.race
+        app.handle_action("runtime:+")
+        self.assertEqual(evolution.max_runtime, 30)
         ppo.update(1 / 60)
         app.draw_world()
         app.draw_panel()
         app.handle_action("algorithm:evolution")
         self.assertIs(app.race, evolution)
+        self.assertEqual(app.max_runtime, 30)
         app.handle_action("algorithm:ppo")
         self.assertIs(app.race, ppo)
         app.handle_action("road:+")
@@ -269,6 +319,7 @@ class PPOTests(unittest.TestCase):
         positions = {action: rect for rect, action in app.buttons}
         app.handle_action("algorithm:ppo")
         app.draw_panel()
+        self.assertEqual({action for _, action in app.buttons}, set(positions))
         for rect, action in app.buttons:
             self.assertEqual(rect, positions[action])
 

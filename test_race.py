@@ -228,10 +228,12 @@ class RaceTests(unittest.TestCase):
             self.assertEqual(race.generation, 1)
             race.cars[7].laps_completed = 4
             race.cars[7].best_progress = race.track.length * 4
+            race.cars[7].progress = race.cars[7].best_progress
             race.update(0)
             self.assertEqual(race.generation, 1)
             race.cars[7].laps_completed = 5
             race.cars[7].best_progress = race.track.length * 5
+            race.cars[7].progress = race.cars[7].best_progress
             race.update(0)
         self.assertEqual(race.generation, 2)
         self.assertEqual(race.track.level, 2)
@@ -257,11 +259,16 @@ class RaceTests(unittest.TestCase):
         race = Race(Track(1), 7, [8], time_limit_enabled=False)
         race.cars[1].laps_completed = 1
         race.cars[1].best_progress = race.track.length
+        race.cars[1].progress = race.track.length
         race.cars[1].fastest_lap = 3.0
         race.cars[2].laps_completed = 4
         race.cars[2].best_progress = race.track.length * 4
+        race.cars[2].progress = race.track.length * 4
         race.cars[2].fastest_lap = 8.0
         self.assertIs(race.leader, race.cars[2])
+        race.cars[2].progress = race.track.length / 2
+        self.assertIs(race.leader, race.cars[1])
+        self.assertIs(race.scoring_car, race.cars[2])
 
     def test_road_eight_records_why_a_live_leader_started_a_new_generation(self):
         race = Race(Track(8), 7, [8], time_limit_enabled=False)
@@ -271,6 +278,7 @@ class RaceTests(unittest.TestCase):
             self.assertEqual(race.generation, 1)
             race.cars[0].laps_completed = 5
             race.cars[0].best_progress = race.track.length * 5
+            race.cars[0].progress = race.cars[0].best_progress
             race.update(0)
         transition = race.transition_history[-1]
         self.assertEqual(race.generation, 2)
@@ -286,6 +294,7 @@ class RaceTests(unittest.TestCase):
         with patch.object(Car, "update", return_value=None):
             app.race.cars[4].laps_completed = 5
             app.race.cars[4].best_progress = app.race.track.length * 5
+            app.race.cars[4].progress = app.race.cars[4].best_progress
             app.race.update(0)
         app.draw_panel()
         self.assertTrue(any(action == "debug" for _, action in app.buttons))
@@ -507,6 +516,7 @@ class RaceTests(unittest.TestCase):
         def score_by_slot(car, track, dt):
             if car in race.cars:
                 car.best_progress = track.length * (race.cars.index(car) / 100)
+                car.progress = car.best_progress
         with patch.object(Car, "update", score_by_slot):
             race.update(1)
         self.assertAlmostEqual(race.current_score, 49)
@@ -550,6 +560,7 @@ class RaceTests(unittest.TestCase):
                 car.alive = False
             elif car is race.cars[5]:
                 car.best_progress = track.length * 0.3
+                car.progress = car.best_progress
         with patch.object(Car, "update", champion_crashes_others_run):
             race.update(0.01)
             self.assertEqual(race.generation, generation)  # the heat carries on

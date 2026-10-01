@@ -100,14 +100,18 @@ class PPOAgent:
             following = delta + gamma * gae_lambda * (1.0 - dones[t]) * following
             advantages[t] = following
         returns = advantages + values
-        flat_advantages = advantages.reshape(-1)
+        valid = np.stack([
+            step["valid"] if "valid" in step else np.ones_like(step["dones"], dtype=bool)
+            for step in rollout
+        ]).reshape(-1)
+        flat_advantages = advantages.reshape(-1)[valid]
         flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
         self._data = {
-            "observations": torch.as_tensor(np.concatenate([step["observations"] for step in rollout])),
-            "raw_actions": torch.as_tensor(np.concatenate([step["raw_actions"] for step in rollout])),
-            "old_logp": torch.as_tensor(np.concatenate([step["logp"] for step in rollout])),
+            "observations": torch.as_tensor(np.concatenate([step["observations"] for step in rollout])[valid]),
+            "raw_actions": torch.as_tensor(np.concatenate([step["raw_actions"] for step in rollout])[valid]),
+            "old_logp": torch.as_tensor(np.concatenate([step["logp"] for step in rollout])[valid]),
             "advantages": torch.as_tensor(flat_advantages),
-            "returns": torch.as_tensor(returns.reshape(-1)),
+            "returns": torch.as_tensor(returns.reshape(-1)[valid]),
         }
         self._order = torch.randperm(len(flat_advantages))
         self._cursor = 0
