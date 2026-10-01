@@ -415,8 +415,10 @@ class Car:
         previous_progress = self.progress
         current = self.progress % track.length
         delta = (position - current + track.length / 2) % track.length - track.length / 2
-        if -15 < delta < 15:
-            self.progress += delta
+        # The nearby-segment projection can move more than 15 px through a
+        # tight bend. Rejecting it leaves progress permanently behind the car.
+        # Track.progress keeps the projection local; unwrap the finish line here.
+        self.progress += delta
         while self.progress >= (self.laps_completed + 1) * track.length:
             finish_distance = (self.laps_completed + 1) * track.length
             finish_fraction = (finish_distance - previous_progress) / (self.progress - previous_progress)
@@ -463,6 +465,7 @@ class Race:
         self.time_limit_enabled = time_limit_enabled
         self.sizes = (inputs + EXTRA_INPUTS, *hidden, 3)
         self.generation = 1
+        self.restart_level = 1
         self.elapsed = 0.0
         self.best_ever = 0.0
         self.fastest_ever: float | None = None
@@ -580,6 +583,7 @@ class Race:
     def change_track(self, track: Track) -> None:
         """Jump to another road: the heat restarts and the gauntlet begins there."""
         self.track = track
+        self.restart_level = track.level
         self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
         self.fastest_ever = None
@@ -649,7 +653,7 @@ class Race:
         else:
             winner_text = "a random starting network"
         headline = f"Generation {self.generation} was won by {winner_text}."
-        next_track = self.track_for(1)
+        next_track = self.track_for(self.restart_level)
         if champion_car is None:
             self.champion = brains[0]
             self._reset_gauntlet()
@@ -664,19 +668,19 @@ class Race:
                     next_track = self.track_for(self.track.level + 1)
                 outcome = f"The first champion finished five laps; next is road {next_track.level}."
             else:
-                outcome = "It is the first champion; the run starts on road 1."
+                outcome = f"It is the first champion; the run starts on road {self.restart_level}."
         else:
             crashed = not champion_car.alive
             # A challenger must be clearly fitter on this road to take the title.
             beaten = fitness[winner_index] > fitness[0] * (1 + BEAT_MARGIN) and winner_index != 0
             if crashed or beaten:
-                # Crash, or a clearly better car: new champion, back to road 1.
+                # Restart from the road chosen manually, or road 1 by default.
                 self.champion = brains[0]
                 self._reset_gauntlet()
                 outcome = (
-                    "The champion crashed, so the best car of the heat is the new champion; back to road 1."
+                    f"The champion crashed, so the best car of the heat is the new champion; back to road {self.restart_level}."
                     if crashed else
-                    "It beat the champion by enough to take over; back to road 1."
+                    f"It beat the champion by enough to take over; back to road {self.restart_level}."
                 )
             else:
                 outcome = "The champion keeps its title."
@@ -1225,6 +1229,7 @@ class App:
         if isinstance(race, Race):
             data["race"].update({
                 "generation": race.generation,
+                "restart_road": race.restart_level,
                 "lap_target": race.laps_required,
                 "champion_laps": race.champion_laps,
                 "champion_alive": race.champion_car.alive if race.champion_car else None,
@@ -1238,6 +1243,8 @@ class App:
             data["race"].update({
                 "generation": race.generation,
                 "generation_end_condition": "leader_five_laps_or_all_crashed",
+                "lap_target": LAPS_PER_ROAD,
+                "leader_index": next((i for i, car in enumerate(race.cars) if car is leader), None),
                 "ppo_updates": race.agent.updates,
                 "ppo_episodes": race.episodes,
                 "clean_runs_on_road": race.clean_runs_on_road,

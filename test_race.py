@@ -411,6 +411,18 @@ class RaceTests(unittest.TestCase):
             self.finish_heat(race)
         self.assertEqual((race.track.level, race.tracks_completed, race.laps_banked), (1, 0, 0))
 
+    def test_manual_road_selection_survives_failed_generations(self):
+        race = Race(Track(1), 7, [8], time_limit_enabled=False)
+        race.change_track(Track(8))
+        with patch.object(Car, "update", return_value=None):
+            for _ in range(2):
+                for car in race.cars:
+                    car.alive = False
+                race.update(0)
+                self.assertEqual(race.track.level, 8)
+                self.assertEqual(race.restart_level, 8)
+        self.assertEqual(race.generation, 3)
+
     def test_clearly_better_challenger_replaces_champion_and_resets(self):
         race = self.crowned_race()
         with self.gauntlet(race, laps_per_heat=5):

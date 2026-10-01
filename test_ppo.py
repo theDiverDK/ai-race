@@ -130,6 +130,23 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(race.episodes, main.PPO_WORKERS * main.PPO_CLEAN_RUNS_PER_ROAD)
         np.testing.assert_array_equal(race.rollout[0]["dones"], np.ones(main.PPO_WORKERS))
 
+    def test_projection_changes_above_fifteen_pixels_still_finish_five_laps(self):
+        race = PPORace(Track(7), 7, [8], 25, False, self.directory / "ppo_checkpoint.pt", resume=False)
+        for car in race.cars[1:]:
+            car.alive = False
+        positions = [(position, 0) for _ in range(5) for position in (20, 40, 60, 80, 0)]
+        with patch.object(race.track, "length", 100):
+            with patch.object(race.track, "on_road", return_value=True):
+                with patch.object(race.track, "progress", side_effect=positions):
+                    for _ in positions:
+                        race._advance(list(range(main.PPO_WORKERS)), 0.1, collect=False)
+        self.assertEqual(race.generation, 2)
+        previous = race.transition_history[-1]
+        self.assertEqual(previous["reason"], "five_laps_completed")
+        self.assertEqual(previous["cars_before"][0]["laps_completed"], 5)
+        self.assertEqual(previous["cars_before"][0]["progress"], 500)
+        self.assertTrue(all(car.alive and car.laps_completed == 0 for car in race.cars))
+
     def test_ppo_panel_shows_completed_clean_rounds(self):
         app = App()
         app.handle_action("algorithm:ppo")

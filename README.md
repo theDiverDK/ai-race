@@ -51,7 +51,7 @@ Each evolutionary generation starts with 50 cars. Their sensor distances feed a 
 
 The best car (the *champion*) always sits in slot 0 of each generation, unchanged. Training always starts on Road 1. A generation ends when a living car finishes five laps, all cars stop, or the optional time limit expires. The champion must finish 5 laps on a road (laps carry over between generations when the time limit is enabled) before the next road starts; Roads 1 to 11 run in order. Road 11 also needs five laps. Its optional time limit is at least 60 seconds. After that, roads are random, and every road the champion completes keeps adding to the **Tracks completed** counter shown on the track and in the panel.
 
-The counter resets to 0 and training restarts on Road 1 whenever the champion crashes (leaves the road, stalls, or goes 4 seconds without gaining 30 px of forward progress) or another car is clearly fitter: more than twice its fitness (see below). The best car of that generation becomes the new champion. Jumping to another road with the road arrows also resets the counter and starts the gauntlet from that road.
+The counter resets to 0 whenever the champion crashes (leaves the road, stalls, or goes 4 seconds without gaining 30 px of forward progress) or another car is clearly fitter: more than twice its fitness (see below). The best car of that generation becomes the new champion. Training restarts on Road 1 by default. Choosing a road with the arrows makes that road the restart point, so a failed generation cannot undo the selection. Completing five laps still advances the gauntlet to the next road.
 
 ### Training on the displayed road
 
@@ -71,7 +71,7 @@ Each network is fully connected with `tanh` neurons. Its inputs are the sensor d
 
 ### Who won the last generation
 
-When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. Another line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). A third line says why the generation ended: five laps, time limit, or all cars stopped. When the champion crashes the heat carries on until another car finishes five laps, the enabled time limit expires, or the last car stops. The score switches to the best car still racing, starting from zero, and the note appears when the heat ends.
+When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. Another line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two returns to the selected restart road). A third line says why the generation ended: five laps, time limit, or all cars stopped. When the champion crashes the heat carries on until another car finishes five laps, the enabled time limit expires, or the last car stops. The score switches to the best car still racing, starting from zero, and the note appears when the heat ends.
 
 ### Score
 
