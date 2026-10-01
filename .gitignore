@@ -7,3 +7,5 @@ ppo_checkpoint.pt
 ppo_checkpoint.pt.tmp
 app_settings.json
 app_settings.json.tmp
+debug_snapshot.json
+debug_snapshot.json.tmp

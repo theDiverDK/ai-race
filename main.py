@@ -7,6 +7,7 @@ import random
 import json
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pygame
@@ -24,7 +25,6 @@ DEFAULT_MAX_RUNTIME = 25
 DEFAULT_HIDDEN_WIDTH = 16
 SENSOR_RANGE = 175
 LAPS_PER_ROAD = 5
-FINAL_ROAD_LAPS = 10
 FINAL_ROAD_RUNTIME = 60
 # A challenger takes the title only when its fitness is more than (1 + this) times the
 # champion's. Fitness is noisy and the population keeps improving, so a small margin
@@ -50,6 +50,12 @@ ORIENTATION_NAMES = {
     (False, False): "", (True, False): "mirrored",
     (False, True): "reversed", (True, True): "mirrored + reversed",
 }
+
+
+def debug_number(value: float) -> float | str:
+    return round(value, 6) if math.isfinite(value) else str(value)
+
+
 # The brain also feels its own speed (signed, scaled by top speed): without it
 # a network cannot tell how hard to brake for a bend it is approaching.
 EXTRA_INPUTS = 1
@@ -341,15 +347,14 @@ class Car:
     steering: float = 0.0
     drive: float = 0.0
     brake: float = 0.0
+    death_reason: str | None = None
     sensor_noise: float = SENSOR_NOISE
     progress_mark: float = 0.0  # best_progress when it last moved forward enough
     mark_time: float = 0.0
 
     @property
     def rank_key(self) -> tuple[int, float, float]:
-        if self.fastest_lap is not None:
-            return 1, -self.fastest_lap, self.best_progress
-        return 0, self.best_progress, min(self.time, 10) * 0.05
+        return self.laps_completed, self.best_progress, -(self.fastest_lap or float("inf"))
 
     def lap_score(self, track: Track) -> float:
         """Points for finished laps only: lap points plus a pace bonus per lap."""
@@ -404,6 +409,7 @@ class Car:
         self.y += math.sin(self.angle) * self.speed * dt
         if not track.on_road(self.x, self.y):
             self.alive = False
+            self.death_reason = "left_road"
             return
         position, self.nearest = track.progress(self.x, self.y, self.nearest)
         previous_progress = self.progress
@@ -426,18 +432,20 @@ class Car:
             self.mark_time = self.time
         elif self.time - self.mark_time > STAGNATION_SECONDS:
             self.alive = False
+            self.death_reason = "no_forward_progress"
         if self.time > 4.0 and self.distance_travelled < 10:
             self.alive = False
+            self.death_reason = self.death_reason or "barely_moved"
         if self.time > 8.0 and abs(self.speed) < 3:
             self.alive = False
+            self.death_reason = self.death_reason or "stalled"
 
 
 class Race:
     """Runs heats and tracks the champion through the gauntlet.
 
-    The champion (slot 0 of every generation) must finish 5 laps on each road
-    in turn, 10 on the final road, then faces random roads. A crash or a
-    clearly better challenger crowns a new champion and restarts at road 1.
+    A car can finish a road after five laps. The champion (slot 0) carries its
+    gauntlet progress forward; a crash or clearly better challenger restarts it.
     """
 
     def __init__(
@@ -474,7 +482,8 @@ class Race:
         self.record_brain = record_brain or (seed_networks[0] if seed_networks else None)
         # Slots only mean something once a generation was bred from ranked parents.
         self.roles_known = bool(seed_networks)
-        self.last_result: tuple[str, str] | None = None  # who won the previous generation
+        self.last_result: tuple[str, ...] | None = None  # result and exact end reason
+        self.transition_history: list[dict] = []
         self._tracks = {(track.level, track.mirror, track.reverse): track}
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
@@ -513,7 +522,7 @@ class Race:
 
     @property
     def laps_required(self) -> int:
-        return FINAL_ROAD_LAPS if self.track.level == len(ROAD_SPECS) else LAPS_PER_ROAD
+        return LAPS_PER_ROAD
 
     @property
     def heat_limit(self) -> int:
@@ -594,13 +603,38 @@ class Race:
             self.best_score_ever = self.current_score
             self.record_tracks = self.tracks_completed
             self.record_brain = self.scoring_car.brain
-        goal = self.champion is not None and self.champion_laps >= self.laps_required
+        finishers = [index for index, car in enumerate(self.cars)
+                     if car.alive and car.laps_completed >= self.laps_required]
+        goal = bool(finishers)
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
         anyone_alive = any(car.alive for car in self.cars)
         if goal or time_expired or not anyone_alive:
-            self._end_heat(goal)
+            reason = "five_laps_completed" if goal else "max_runtime" if time_expired else "all_cars_stopped"
+            self._end_heat(goal, reason, finishers)
 
-    def _end_heat(self, goal: bool) -> None:
+    def _end_heat(self, goal: bool, reason: str, finishers: list[int]) -> None:
+        leader = self.leader
+        leader_index = next((index for index, car in enumerate(self.cars) if car is leader), None)
+        transition = {
+            "reason": reason,
+            "generation_before": self.generation,
+            "road_before": self.track.level,
+            "elapsed_seconds": debug_number(self.elapsed),
+            "time_limit_enabled": self.time_limit_enabled,
+            "max_runtime_seconds": self.max_runtime,
+            "heat_limit_seconds": self.heat_limit,
+            "lap_target": self.laps_required,
+            "alive_count": sum(car.alive for car in self.cars),
+            "finisher_indices": finishers[:],
+            "finishers_before": [self._car_debug(index) for index in finishers],
+            "champion_laps_before": self.champion_laps,
+            "champion_before": self._car_debug(0) if self.champion is not None else None,
+            "leader_before": self._car_debug(leader_index) if leader_index is not None else None,
+            "top_cars_before": [self._car_debug(index) for index in sorted(
+                range(len(self.cars)), key=lambda index: self.cars[index].best_progress,
+                reverse=True,
+            )[:5]],
+        }
         fitness = [self.fitness(index) for index in range(len(self.cars))]
         ranked = [((value,), car.brain) for value, car in zip(fitness, self.cars)]
         self.history.append(max(car.best_progress for car in self.cars))
@@ -618,9 +652,20 @@ class Race:
         if champion_car is None:
             self.champion = brains[0]
             self._reset_gauntlet()
-            outcome = "It is the first champion; the run starts on road 1."
+            if goal and winner_index in finishers:
+                self.run_banked = self.cars[winner_index].lap_score(self.track)
+                self.tracks_completed = 1
+                if self.track.level == len(ROAD_SPECS):
+                    self.random_phase = True
+                    next_track = self.track_for(
+                        self.rng.randint(1, len(ROAD_SPECS)), *self.rng.choice(ORIENTATIONS))
+                else:
+                    next_track = self.track_for(self.track.level + 1)
+                outcome = f"The first champion finished five laps; next is road {next_track.level}."
+            else:
+                outcome = "It is the first champion; the run starts on road 1."
         else:
-            crashed = not champion_car.alive and not goal
+            crashed = not champion_car.alive
             # A challenger must be clearly fitter on this road to take the title.
             beaten = fitness[winner_index] > fitness[0] * (1 + BEAT_MARGIN) and winner_index != 0
             if crashed or beaten:
@@ -637,7 +682,7 @@ class Race:
                 brains[0] = self.champion  # the champion always survives unchanged
                 next_track = self.track  # laps are still owed on this road
                 self.run_banked += champion_car.lap_score(self.track)
-                if goal:
+                if champion_car.alive and self.champion_laps >= self.laps_required:
                     self.tracks_completed += 1
                     self.laps_banked = 0
                     outcome = f"The champion finished road {self.track.level} and has now completed {self.tracks_completed}."
@@ -658,8 +703,35 @@ class Race:
         self._spawn(brains)
         self.generation += 1
         self.roles_known = True
-        self.last_result = (headline, outcome)
+        reason_text = {
+            "five_laps_completed": "Five laps completed",
+            "max_runtime": "Time limit reached",
+            "all_cars_stopped": "All cars stopped",
+        }[reason]
+        self.last_result = (headline, outcome, f"Generation ended: {reason_text}.")
         self.current_score = self.run_score
+        transition.update({
+            "winner_index": winner_index,
+            "winner_fitness": debug_number(fitness[winner_index]),
+            "generation_after": self.generation,
+            "road_after": self.track.level,
+            "outcome": outcome,
+        })
+        self.transition_history.append(transition)
+        self.transition_history = self.transition_history[-20:]
+
+    def _car_debug(self, index: int) -> dict:
+        car = self.cars[index]
+        return {
+            "index": index,
+            "alive": car.alive,
+            "death_reason": car.death_reason,
+            "laps_completed": car.laps_completed,
+            "progress": debug_number(car.progress),
+            "best_progress": debug_number(car.best_progress),
+            "time_seconds": debug_number(car.time),
+            "speed": debug_number(car.speed),
+        }
 
     @property
     def leader(self) -> Car | None:
@@ -909,12 +981,13 @@ class App:
         self.title = pygame.font.SysFont("Avenir Next", 32, bold=True)
         self.save_path = save_path or SAVE_PATH
         self.settings_path = self.save_path.with_name("app_settings.json")
+        self.debug_path = self.save_path.with_name("debug_snapshot.json")
         settings = self._read_settings()
         self.ppo_topology = self._valid_topology(settings.get("ppo"))
         self.inputs = 7
         self.hidden = [DEFAULT_HIDDEN_WIDTH, DEFAULT_HIDDEN_WIDTH]
         self.max_runtime = DEFAULT_MAX_RUNTIME
-        self.time_limit_enabled = True
+        self.time_limit_enabled = False  # Evolution runs until five laps or every car stops.
         # Resume from the saved champions when possible, otherwise start from scratch.
         saved = load_networks(self.save_path)
         seed, record_tracks, best_score = None, 0, 0.0
@@ -937,6 +1010,8 @@ class App:
         self.show_sensors = True
         self.buttons: list[tuple[pygame.Rect, str]] = []
         self.inspector: NetworkInspector | None = None
+        self.debug_notice: str | None = None
+        self.debug_notice_until = 0
         if settings.get("algorithm") == "ppo":
             self.select_algorithm("ppo", remember=False)
 
@@ -982,7 +1057,7 @@ class App:
                 inputs, hidden = self.ppo_topology or (self.inputs, self.hidden)
                 self.ppo_race = PPORace(
                     Track(1), inputs, hidden, self.max_runtime,
-                    self.time_limit_enabled, self.ppo_path,
+                    True, self.ppo_path,
                 )
             self.race = self.ppo_race
         elif algorithm == "evolution":
@@ -1023,11 +1098,98 @@ class App:
         self.screen.blit(value_text, value_text.get_rect(center=(WIDTH - 77, y + 13)))
         self.button(pygame.Rect(WIDTH - 50, y - 1, 26, 27), "+", f"{key}:+")
 
+    def _debug_car(self, index: int, car: Car) -> dict:
+        number = debug_number
+        return {
+            "index": index,
+            "alive": car.alive,
+            "death_reason": car.death_reason,
+            "position": [number(car.x), number(car.y)],
+            "heading_radians": number(car.angle),
+            "speed": number(car.speed),
+            "time_seconds": number(car.time),
+            "laps_completed": car.laps_completed,
+            "progress": number(car.progress),
+            "best_progress": number(car.best_progress),
+            "steering": number(car.steering),
+            "drive": number(car.drive),
+            "brake": number(car.brake),
+            "sensors": [number(value) for value in car.sensors],
+            "network_sizes": list(car.brain.sizes),
+        }
+
+    def debug_snapshot(self) -> dict:
+        race = self.race
+        leader = race.leader
+        data = {
+            "schema_version": 1,
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "app": {
+                "algorithm": self.algorithm,
+                "paused": self.paused,
+                "speed_multiplier": self.speed,
+                "max_runtime_seconds": self.max_runtime,
+                "time_limit_enabled": self.time_limit_enabled,
+                "selected_inputs": self.inputs,
+                "selected_hidden_layers": self.hidden[:],
+            },
+            "road": {
+                "level": race.track.level,
+                "name": race.track.name,
+                "mirrored": race.track.mirror,
+                "reversed": race.track.reverse,
+                "length": debug_number(race.track.length),
+            },
+            "race": {
+                "elapsed_seconds": debug_number(race.elapsed),
+                "alive_count": sum(car.alive for car in race.cars),
+                "last_result": list(race.last_result) if race.last_result else None,
+            },
+            "cars": [self._debug_car(index, car) for index, car in enumerate(race.cars)],
+            "evolution_recent_transitions": self.evolution_race.transition_history[-20:],
+        }
+        if isinstance(race, Race):
+            data["race"].update({
+                "generation": race.generation,
+                "lap_target": race.laps_required,
+                "champion_laps": race.champion_laps,
+                "champion_alive": race.champion_car.alive if race.champion_car else None,
+                "leader_index": next((i for i, car in enumerate(race.cars) if car is leader), None),
+                "tracks_completed": race.tracks_completed,
+                "best_distance": debug_number(race.best_ever),
+                "run_score": debug_number(race.current_score),
+                "best_score_ever": debug_number(race.best_score_ever),
+            })
+        else:
+            data["race"].update({
+                "ppo_updates": race.agent.updates,
+                "ppo_episodes": race.episodes,
+                "clean_runs_on_road": race.clean_runs_on_road,
+                "mean_reward": debug_number(race.mean_reward),
+                "rollout_steps": len(race.rollout),
+                "optimizing": race.agent.optimizing,
+                "policy_loss": debug_number(race.agent.policy_loss),
+                "value_loss": debug_number(race.agent.value_loss),
+            })
+        return data
+
+    def write_debug_snapshot(self) -> None:
+        temporary = self.debug_path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(self.debug_snapshot(), indent=2, allow_nan=False) + "\n", encoding="utf-8")
+            temporary.replace(self.debug_path)
+            self.debug_notice = f"Saved {self.debug_path.name}"
+        except (OSError, ValueError, TypeError):
+            self.debug_notice = "Could not save debug snapshot"
+        self.debug_notice_until = pygame.time.get_ticks() + 4000
+
     def handle_action(self, action: str) -> None:
         if action == "pause":
             self.paused = not self.paused
         elif action == "speed":
             self.speed = {1: 2, 2: 4, 4: 8, 8: 1}[self.speed]
+        elif action == "debug":
+            self.write_debug_snapshot()
         elif action == "limit":
             self.time_limit_enabled = not self.time_limit_enabled
             self.race.time_limit_enabled = self.time_limit_enabled
@@ -1125,6 +1287,8 @@ class App:
             self.label(f"Run score: {self.race.current_score:,.0f}", hud_x + 15, 160, ORANGE, self.font)
             self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", hud_x + 16, 186, MUTED, self.small)
             lines = [*(self.race.last_result or ()), "All cars train on the displayed road."]
+        if self.debug_notice and pygame.time.get_ticks() < self.debug_notice_until:
+            lines.append(self.debug_notice)
         top = HEIGHT - 66 - 21 * len(lines)
         pygame.draw.rect(self.screen, (11, 22, 30), (22, top - 6, 640, 21 * len(lines) + 10), border_radius=8)
         for row, line in enumerate(lines):
@@ -1158,8 +1322,9 @@ class App:
         )
         pygame.draw.polygon(self.screen, TEXT, arrow)
 
-        self.button(pygame.Rect(x + 22, 109, 146, 32), "RESUME" if self.paused else "PAUSE", "pause")
-        self.button(pygame.Rect(x + 177, 109, 160, 32), f"SPEED  {self.speed}×", "speed")
+        self.button(pygame.Rect(x + 22, 109, 96, 32), "RESUME" if self.paused else "PAUSE", "pause")
+        self.button(pygame.Rect(x + 126, 109, 102, 32), f"SPEED {self.speed}×", "speed")
+        self.button(pygame.Rect(x + 236, 109, 102, 32), "DEBUG", "debug")
         pygame.draw.line(self.screen, (46, 65, 72), (x + 22, 151), (WIDTH - 22, 151))
 
         alive = sum(car.alive for car in self.race.cars)

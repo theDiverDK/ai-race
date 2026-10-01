@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,6 +133,15 @@ class PPOTests(unittest.TestCase):
             call.args[0] == "Clean runs: 2/5 to next road"
             for call in label.call_args_list
         ))
+
+    def test_debug_snapshot_in_ppo_mode_includes_training_state(self):
+        app = App()
+        app.handle_action("algorithm:ppo")
+        app.handle_action("debug")
+        payload = json.loads((self.directory / "debug_snapshot.json").read_text())
+        self.assertEqual(payload["app"]["algorithm"], "ppo")
+        self.assertEqual(payload["race"]["ppo_updates"], app.race.agent.updates)
+        self.assertEqual(len(payload["cars"]), main.PPO_WORKERS)
 
     def test_crashes_and_unlimited_time_do_not_count_as_clean_runs(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)

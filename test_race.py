@@ -1,4 +1,5 @@
 import os
+import json
 import math
 import random
 import tempfile
@@ -181,17 +182,18 @@ class RaceTests(unittest.TestCase):
 
     def test_ui_controls_update_active_race(self):
         app = App()
+        self.assertFalse(app.race.time_limit_enabled)
         brains = [car.brain for car in app.race.cars]
         app.handle_action("runtime:+")
         app.handle_action("limit")
         app.handle_action("road:+")
         self.assertEqual(app.race.max_runtime, 30)
-        self.assertFalse(app.race.time_limit_enabled)
+        self.assertTrue(app.race.time_limit_enabled)
         self.assertEqual(app.road_level, 2)
         self.assertEqual(app.race.track.level, 2)
         self.assertTrue(all(car.brain is brain for car, brain in zip(app.race.cars, brains)))
         app.handle_action("apply")
-        self.assertFalse(app.race.time_limit_enabled)
+        self.assertTrue(app.race.time_limit_enabled)
 
     def test_network_button_accepts_window_object_events(self):
         app = App()
@@ -216,6 +218,98 @@ class RaceTests(unittest.TestCase):
             race.cars[0].alive = False
             race.update(0)
             self.assertEqual(race.generation, 2)
+
+    def test_evolution_runs_past_25_seconds_until_a_car_finishes_five_laps(self):
+        app = App()
+        race = app.race
+        self.assertFalse(race.time_limit_enabled)
+        with patch.object(Car, "update", return_value=None):
+            race.update(30)
+            self.assertEqual(race.generation, 1)
+            race.cars[7].laps_completed = 4
+            race.cars[7].best_progress = race.track.length * 4
+            race.update(0)
+            self.assertEqual(race.generation, 1)
+            race.cars[7].laps_completed = 5
+            race.cars[7].best_progress = race.track.length * 5
+            race.update(0)
+        self.assertEqual(race.generation, 2)
+        self.assertEqual(race.track.level, 2)
+        self.assertEqual(race.transition_history[-1]["reason"], "five_laps_completed")
+        self.assertEqual(race.transition_history[-1]["leader_before"]["index"], 7)
+
+    def test_banked_champion_laps_do_not_end_an_unlimited_generation_early(self):
+        race = Race(Track(3), 7, [8], time_limit_enabled=False)
+        race.champion = race.cars[0].brain
+        race.laps_banked = 4
+        with patch.object(Car, "update", return_value=None):
+            race.cars[0].laps_completed = 1
+            race.cars[0].best_progress = race.track.length
+            race.update(30)
+            self.assertEqual(race.generation, 1)
+            race.cars[0].laps_completed = 5
+            race.cars[0].best_progress = race.track.length * 5
+            race.update(0)
+        self.assertEqual(race.generation, 2)
+        self.assertEqual(race.track.level, 4)
+
+    def test_leader_is_car_furthest_through_race(self):
+        race = Race(Track(1), 7, [8], time_limit_enabled=False)
+        race.cars[1].laps_completed = 1
+        race.cars[1].best_progress = race.track.length
+        race.cars[1].fastest_lap = 3.0
+        race.cars[2].laps_completed = 4
+        race.cars[2].best_progress = race.track.length * 4
+        race.cars[2].fastest_lap = 8.0
+        self.assertIs(race.leader, race.cars[2])
+
+    def test_road_eight_records_why_a_live_leader_started_a_new_generation(self):
+        race = Race(Track(8), 7, [8], time_limit_enabled=False)
+        race.champion = race.cars[0].brain
+        with patch.object(Car, "update", return_value=None):
+            race.update(30)
+            self.assertEqual(race.generation, 1)
+            race.cars[0].laps_completed = 5
+            race.cars[0].best_progress = race.track.length * 5
+            race.update(0)
+        transition = race.transition_history[-1]
+        self.assertEqual(race.generation, 2)
+        self.assertEqual(race.track.level, 9)
+        self.assertEqual(transition["reason"], "five_laps_completed")
+        self.assertFalse(transition["time_limit_enabled"])
+        self.assertTrue(transition["leader_before"]["alive"])
+        self.assertEqual(transition["leader_before"]["laps_completed"], 5)
+        self.assertEqual((transition["road_before"], transition["road_after"]), (8, 9))
+
+    def test_debug_button_saves_generation_reason_and_car_state(self):
+        app = App()
+        with patch.object(Car, "update", return_value=None):
+            app.race.cars[4].laps_completed = 5
+            app.race.cars[4].best_progress = app.race.track.length * 5
+            app.race.update(0)
+        app.draw_panel()
+        self.assertTrue(any(action == "debug" for _, action in app.buttons))
+        app.handle_action("debug")
+        payload = json.loads((self.save_path.parent / "debug_snapshot.json").read_text())
+        transition = payload["evolution_recent_transitions"][-1]
+        self.assertEqual(transition["reason"], "five_laps_completed")
+        self.assertEqual(transition["leader_before"]["index"], 4)
+        self.assertEqual((transition["road_before"], transition["road_after"]), (1, 2))
+        self.assertEqual(payload["race"]["generation"], 2)
+        self.assertEqual(len(payload["cars"]), POPULATION)
+
+    def test_debug_button_is_clickable(self):
+        app = App()
+        app.draw_panel()
+        button = next(rect for rect, action in app.buttons if action == "debug")
+        click = pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            {"window": app.main_window, "pos": button.center, "button": 1},
+        )
+        with patch.object(app.race, "update", return_value=None):
+            with patch("pygame.event.get", side_effect=[[click], [pygame.event.Event(pygame.QUIT)]]):
+                app.run()
+        self.assertTrue((self.save_path.parent / "debug_snapshot.json").exists())
 
     def one_lap_runner(self, race):
         def one_car_completes_lap(car, track, dt):
@@ -269,6 +363,14 @@ class RaceTests(unittest.TestCase):
         self.assertIs(race.champion, race.cars[0].brain)
         self.assertEqual((race.track.level, race.tracks_completed), (1, 0))
 
+    def test_first_champion_keeps_completed_lap_score_on_next_road(self):
+        race = Race(Track(1), 7, [8], time_limit_enabled=False)
+        with self.gauntlet(race, laps_per_heat=5):
+            race.update(0)
+        self.assertEqual(race.track.level, 2)
+        self.assertGreater(race.run_banked, 0)
+        self.assertAlmostEqual(race.current_score, race.run_banked)
+
     def test_five_laps_complete_a_road_and_move_to_the_next(self):
         race = self.crowned_race()
         champion = race.champion
@@ -288,7 +390,7 @@ class RaceTests(unittest.TestCase):
             self.assertEqual(race.laps_banked, 4)
             self.assertEqual(race.champion_laps, 4)
         with self.gauntlet(race, laps_per_heat=1):
-            race.update(0.01)
+            self.finish_heat(race)
         self.assertEqual((race.tracks_completed, race.track.level), (1, 2))
 
     def test_crash_restarts_from_road_one_with_zero_count(self):
@@ -332,19 +434,19 @@ class RaceTests(unittest.TestCase):
         self.assertIs(race.cars[0].brain, champion)
         self.assertEqual(race.laps_banked, 1)
 
-    def test_final_road_needs_ten_laps_sixty_seconds_then_random_roads(self):
+    def test_final_road_needs_five_laps_then_random_roads(self):
         race = self.crowned_race()
         race.change_track(Track(11))
-        self.assertEqual((race.laps_required, race.heat_limit), (10, 60))
-        with self.gauntlet(race, laps_per_heat=9):
+        self.assertEqual((race.laps_required, race.heat_limit), (5, 60))
+        with self.gauntlet(race, laps_per_heat=4):
             race.update(0.01)
         self.assertEqual(race.tracks_completed, 0)
-        with self.gauntlet(race, laps_per_heat=10):
+        with self.gauntlet(race, laps_per_heat=5):
             race.update(0.01)
         self.assertEqual(race.tracks_completed, 1)
         self.assertTrue(race.random_phase)
         seen = set()
-        with self.gauntlet(race, laps_per_heat=10):
+        with self.gauntlet(race, laps_per_heat=5):
             for _ in range(40):
                 race.update(0.01)
                 seen.add(race.track.level)
@@ -676,6 +778,7 @@ class RaceTests(unittest.TestCase):
     def test_app_follows_the_race_to_the_next_road_and_draws_counter(self):
         app = App()
         app.speed = 1
+        app.race.time_limit_enabled = True
         with patch.object(Car, "update", return_value=None):
             self.finish_heat(app.race)
         app.draw_world()  # the counter renders

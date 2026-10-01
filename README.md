@@ -21,11 +21,12 @@ python main.py
 | --- | --- |
 | **Algorithm dropdown** | Choose **Evolution** or **PPO**. The selected mode is saved in `app_settings.json` and restored on startup. Both modes use the same control layout, and each keeps its in-memory training state while you use the other. Evolution saves `best_network.json`; PPO saves `ppo_checkpoint.pt`. |
 | Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks, and restarts the gauntlet there. |
-| Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
-| **Limit On / Limit Off** | Turn the time limit on or off. In Evolution, a heat then continues until every car has crashed or stalled. In PPO, each car restarts after a crash, and automatic road progression waits until the limit is enabled. |
+| Max runtime `−` / `+` | Set the optional heat time limit from 5 to 120 simulated seconds. Changes take effect immediately when the limit is on. |
+| **Limit On / Limit Off** | Turn the time limit on or off. Evolution starts with the limit off: a generation continues until a living car finishes five laps or all cars stop. Turn it on to cap a generation at the selected runtime. PPO starts with the limit on; disabling it pauses automatic road progression. |
 | Input neurons, hidden layers, layer widths | Change the network design. Click **Apply & Restart** to start a new population with those settings. The output layer always has three neurons. |
 | **Pause** / `P` | Pause or resume. |
 | **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Starts at 4×. |
+| **Debug** | Save `debug_snapshot.json` beside `best_network.json`. It records the selected road, settings, all cars, and the last 20 Evolution generation changes with their exact end reasons and car states. The file is ignored by Git and can be shared when diagnosing a surprising reset. |
 | `V` | Show or hide the leading car's sensor rays. |
 | `R` | Restart training with the current settings. |
 | **View Network** | Open a live window for the highest scoring evolutionary car or the current PPO policy. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its activation, bias, weighted input, and exact connection weights. PPO shows the policy's mean action; exploration can make the car's sampled action differ. |
@@ -46,7 +47,7 @@ Each evolutionary generation starts with 50 cars. Their sensor distances feed a 
 
 ### The gauntlet and the counter
 
-The best car (the *champion*) always sits in slot 0 of each generation, unchanged. Training always starts on Road 1. The champion must finish 5 laps on a road (laps carry over between heats) before the next road starts; Roads 1 to 11 run in order, and Road 11 needs 10 laps and gets a 60 second heat. After that, roads are random, and every road the champion completes keeps adding to the **Tracks completed** counter shown on the track and in the panel.
+The best car (the *champion*) always sits in slot 0 of each generation, unchanged. Training always starts on Road 1. A generation ends when a living car finishes five laps, all cars stop, or the optional time limit expires. The champion must finish 5 laps on a road (laps carry over between generations when the time limit is enabled) before the next road starts; Roads 1 to 11 run in order. Road 11 also needs five laps. Its optional time limit is at least 60 seconds. After that, roads are random, and every road the champion completes keeps adding to the **Tracks completed** counter shown on the track and in the panel.
 
 The counter resets to 0 and training restarts on Road 1 whenever the champion crashes (leaves the road, stalls, or goes 4 seconds without gaining 30 px of forward progress) or another car is clearly fitter: more than twice its fitness (see below). The best car of that generation becomes the new champion. Jumping to another road with the road arrows also resets the counter and starts the gauntlet from that road.
 
@@ -68,7 +69,7 @@ Each network is fully connected with `tanh` neurons. Its inputs are the sensor d
 
 ### Who won the last generation
 
-When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. A second line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). When the champion crashes the heat carries on until the time limit or the last car stops, and the score switches to the best car still racing, starting from zero, and the note appears when the heat ends.
+When a new generation starts, a note at the bottom left says who won the previous one and how that car was made: the unchanged champion, the runner-up (an unchanged copy of the 2nd best), a lightly mutated copy of a top car, a bred child of two top cars, or a brand-new random network. Another line says what that meant for the run: the champion keeps its title, finished a road, crashed, or was overtaken (either of the last two sends training back to Road 1). A third line says why the generation ended: five laps, time limit, or all cars stopped. When the champion crashes the heat carries on until another car finishes five laps, the enabled time limit expires, or the last car stops. The score switches to the best car still racing, starting from zero, and the note appears when the heat ends.
 
 ### Score
 
