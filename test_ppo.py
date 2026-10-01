@@ -150,6 +150,41 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(payload["race"]["ppo_updates"], app.race.agent.updates)
         self.assertEqual(len(payload["cars"]), main.PPO_WORKERS)
 
+    def test_debug_after_ppo_reset_preserves_the_previous_groups_crashes(self):
+        app = App()
+        app.handle_action("algorithm:ppo")
+        race = app.race
+        first = race.cars[0]
+
+        def crash_first(car, track, dt, controls):
+            if car is first:
+                car.alive = False
+                car.death_reason = "left_road"
+
+        with patch.object(Car, "move", crash_first):
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
+        app.handle_action("debug")
+        during = json.loads((self.directory / "debug_snapshot.json").read_text())
+        self.assertEqual(len(during["ppo_current_crash_events"]), 1)
+        self.assertEqual(during["ppo_current_crash_events"][0]["death_reason"], "left_road")
+
+        def crash_remaining(car, track, dt, controls):
+            car.alive = False
+            car.death_reason = "no_forward_progress"
+
+        with patch.object(Car, "move", crash_remaining):
+            race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
+        app.handle_action("debug")
+        after = json.loads((self.directory / "debug_snapshot.json").read_text())
+        previous = after["ppo_recent_transitions"][-1]
+        self.assertEqual(previous["reason"], "all_cars_stopped")
+        self.assertEqual((previous["generation_before"], previous["generation_after"]), (1, 2))
+        self.assertEqual(previous["road_before"], previous["road_after"])
+        self.assertEqual(len(previous["crash_events"]), main.PPO_WORKERS)
+        self.assertTrue(all(not car["alive"] for car in previous["cars_before"]))
+        self.assertTrue(all(car["alive"] for car in after["cars"]))
+        self.assertEqual(after["ppo_current_crash_events"], [])
+
     def test_crashed_cars_stay_out_until_all_crash_or_the_leader_finishes_five_laps(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         first = race.cars[0]
@@ -195,6 +230,18 @@ class PPOTests(unittest.TestCase):
         self.assertIs(race.leader, race.cars[1])
         race.cars[1].alive = False
         self.assertIs(race.leader, race.cars[0])
+
+    def test_moving_ppo_car_is_not_eliminated_for_four_seconds_without_progress(self):
+        race = PPORace(Track(7), 7, [8], 25, False, self.directory / "ppo_checkpoint.pt", resume=False)
+        car = race.cars[0]
+        car.time = main.STAGNATION_SECONDS + 0.1
+        car.speed = 100
+        car.distance_travelled = 100
+        with patch.object(race.track, "on_road", return_value=True):
+            with patch.object(race.track, "progress", return_value=(0.0, 0)):
+                car.move(race.track, 0.0, (0.0, 0.0, 0.0))
+        self.assertTrue(car.alive)
+        self.assertIsNone(car.death_reason)
 
     def test_ppo_grid_starts_on_every_road(self):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)

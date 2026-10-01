@@ -347,6 +347,7 @@ class Car:
     drive: float = 0.0
     brake: float = 0.0
     death_reason: str | None = None
+    enforce_progress_timeout: bool = True
     sensor_noise: float = SENSOR_NOISE
     progress_mark: float = 0.0  # best_progress when it last moved forward enough
     mark_time: float = 0.0
@@ -429,7 +430,7 @@ class Car:
         if self.best_progress > self.progress_mark + STAGNATION_DISTANCE:
             self.progress_mark = self.best_progress
             self.mark_time = self.time
-        elif self.time - self.mark_time > STAGNATION_SECONDS:
+        elif self.enforce_progress_timeout and self.time - self.mark_time > STAGNATION_SECONDS:
             self.alive = False
             self.death_reason = "no_forward_progress"
         if self.time > 4.0 and self.distance_travelled < 10:
@@ -781,6 +782,8 @@ class PPORace:
         self.generation = 1  # one generation is one group of cars on the road
         self.episodes = 0
         self.recent_returns: list[float] = []
+        self.current_crash_events: list[dict] = []
+        self.transition_history: list[dict] = []
         self.best_ever = 0.0
         self.fastest_ever: float | None = None
         self.elapsed = 0.0
@@ -805,6 +808,7 @@ class PPORace:
         car = Car(
             self.policy_network, x + px * offset, y + py * offset,
             angle + self.rng.uniform(-START_ANGLE_JITTER, START_ANGLE_JITTER),
+            enforce_progress_timeout=False,
         )
         return car
 
@@ -840,6 +844,57 @@ class PPORace:
     def mean_reward(self) -> float:
         return sum(self.recent_returns) / len(self.recent_returns) if self.recent_returns else 0.0
 
+    def _car_debug(self, index: int) -> dict:
+        car = self.worker_cars[index]
+        number = debug_number
+        return {
+            "index": index,
+            "alive": car.alive,
+            "death_reason": car.death_reason,
+            "position": [number(car.x), number(car.y)],
+            "heading_radians": number(car.angle),
+            "time_seconds": number(car.time),
+            "speed": number(car.speed),
+            "laps_completed": car.laps_completed,
+            "progress": number(car.progress),
+            "best_progress": number(car.best_progress),
+            "progress_mark": number(car.progress_mark),
+            "seconds_since_progress_mark": number(car.time - car.mark_time),
+            "distance_travelled": number(car.distance_travelled),
+            "steering": number(car.steering),
+            "drive": number(car.drive),
+            "brake": number(car.brake),
+            "sensors": [number(value) for value in car.sensors],
+        }
+
+    def _transition_debug(self, reason: str) -> dict:
+        leader = self.leader
+        return {
+            "reason": reason,
+            "generation_before": self.generation,
+            "road_before": self.track.level,
+            "road_name_before": self.track.name,
+            "elapsed_seconds": debug_number(max(car.time for car in self.worker_cars)),
+            "ppo_updates": self.agent.updates,
+            "clean_runs_before": self.clean_runs_on_road,
+            "leader_index_before": next(
+                (index for index, car in enumerate(self.worker_cars) if car is leader), None,
+            ),
+            "cars_before": [self._car_debug(index) for index in range(PPO_WORKERS)],
+            "crash_events": self.current_crash_events[:],
+        }
+
+    def _record_transition(self, transition: dict) -> None:
+        transition.update({
+            "generation_after": self.generation,
+            "road_after": self.track.level,
+            "clean_runs_after": self.clean_runs_on_road,
+            "episodes_after": self.episodes,
+        })
+        self.transition_history.append(transition)
+        self.transition_history = self.transition_history[-20:]
+        self.current_crash_events.clear()
+
     def _advance(self, indices: list[int], dt: float, collect: bool) -> None:
         np = self.np
         active = [index for index in indices if self.worker_cars[index].alive]
@@ -869,6 +924,7 @@ class PPORace:
             rewards[index] += max(0, car.laps_completed - before_laps)
             if not car.alive:
                 rewards[index] -= 2.0
+                self.current_crash_events.append(self._car_debug(index))
             else:
                 post_observations[index] = car.observe(track)
             self.worker_returns[index] += float(rewards[index])
@@ -901,6 +957,9 @@ class PPORace:
                 dones[index] = 0.0
                 self.worker_obs[index] = post_observations[index]
         if group_finished:
+            transition = self._transition_debug(
+                "five_laps_completed" if clean_round else "all_cars_stopped"
+            )
             finished_generation = self.generation
             self.generation += 1
             if switch_road:
@@ -909,11 +968,12 @@ class PPORace:
                 self.clean_runs_on_road = 0
                 self.best_ever = 0.0
                 self.fastest_ever = None
-            reason = "leader completed five laps" if clean_round else "all cars crashed"
+            reason = "leader completed five laps" if clean_round else "all cars were eliminated"
             self.last_result = (
                 f"PPO generation {finished_generation} ended: {reason}.",
                 f"Clean runs: {self.clean_runs_on_road}/{PPO_CLEAN_RUNS_PER_ROAD} on road {self.track.level}.",
             )
+            self._record_transition(transition)
             for index in range(PPO_WORKERS):
                 self._reset_worker(index)
         if collect:
@@ -946,6 +1006,7 @@ class PPORace:
             self.rollout.clear()
 
     def change_track(self, track: Track) -> None:
+        transition = self._transition_debug("manual_road_change")
         self.track = track
         self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
@@ -954,6 +1015,7 @@ class PPORace:
         self.rollout.clear()
         self.generation += 1
         self.last_result = (f"PPO group moved to road {track.level}.",)
+        self._record_transition(transition)
         for index in range(PPO_WORKERS):
             self._reset_worker(index, track)
         self.elapsed = 0.0
@@ -1157,6 +1219,8 @@ class App:
             },
             "cars": [self._debug_car(index, car) for index, car in enumerate(race.cars)],
             "evolution_recent_transitions": self.evolution_race.transition_history[-20:],
+            "ppo_recent_transitions": self.ppo_race.transition_history[-20:] if self.ppo_race else [],
+            "ppo_current_crash_events": self.ppo_race.current_crash_events[:] if self.ppo_race else [],
         }
         if isinstance(race, Race):
             data["race"].update({
@@ -1204,7 +1268,7 @@ class App:
             self.write_debug_snapshot()
         elif action == "limit":
             if self.algorithm == "ppo":
-                self.debug_notice = "PPO resets after five laps or when all cars crash."
+                self.debug_notice = "PPO resets after five laps or when all cars are out."
                 self.debug_notice_until = pygame.time.get_ticks() + 4000
                 return
             self.time_limit_enabled = not self.time_limit_enabled
@@ -1298,7 +1362,7 @@ class App:
             self.label(f"PPO generation {self.race.generation:03d}", hud_x + 15, 56, TEXT, self.bold)
             self.label(f"{sum(car.alive for car in self.race.cars)}/{PPO_WORKERS} PPO cars on this road", hud_x + 16, 84, MUTED, self.small)
             self.label(f"Episodes: {self.race.episodes}", hud_x + 15, 108, ACCENT, self.font)
-            lines = [*(self.race.last_result or ()), "New group after five laps or when all cars crash."]
+            lines = [*(self.race.last_result or ()), "New group after five laps or when all cars are out."]
         else:
             self.label(f"Generation {self.race.generation:02d}", hud_x + 15, 56, TEXT, self.bold)
             alive = sum(car.alive for car in self.race.cars)
