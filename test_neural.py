@@ -5,6 +5,12 @@ from neural import Network, next_generation
 
 
 class NeuralTests(unittest.TestCase):
+    def test_small_populations_keep_the_requested_size(self):
+        rng = random.Random(101)
+        ranked = [((float(i),), Network.random((8, 4, 3), rng)) for i in range(5)]
+        for size in (4, 5, 10, 15):
+            self.assertEqual(len(next_generation(ranked, rng, size)), size)
+
     def test_architecture_and_outputs(self):
         brain = Network.random((7, 9, 4, 3), random.Random(1))
         steering, drive, brake = brain.forward([0.5] * 7)

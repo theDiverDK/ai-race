@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import math
 import json
+import math
 import random
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pygame
@@ -23,7 +24,6 @@ DEFAULT_MAX_RUNTIME = 25
 DEFAULT_HIDDEN_WIDTH = 16
 SENSOR_RANGE = 175
 LAPS_PER_ROAD = 5
-FINAL_ROAD_LAPS = 10
 FINAL_ROAD_RUNTIME = 60
 # A challenger takes the title only when its fitness is more than (1 + this) times the
 # champion's. Fitness is noisy and the population keeps improving, so a small margin
@@ -43,26 +43,24 @@ HOW_MADE = {
     "child": "a bred child of two top cars (crossover + mutation)",
     "newcomer": "a brand-new random network",
 }
-# Selection fitness. Every brain also drives probe roads (other orientations of
-# the same road, plus a nearby road) in the same heat, and is judged on its
-# distance there too, so it cannot win by learning one road or one direction.
-FITNESS_MEAN_WEIGHT = 0.5  # the rest goes to the worst road, so weak spots hurt
 REFERENCE_SPEED = 0.5 * 220.0  # px/s used to scale distance to about 0..1
 ORIENTATIONS = [(False, False), (True, False), (False, True), (True, True)]
 ORIENTATION_NAMES = {
     (False, False): "", (True, False): "mirrored",
     (False, True): "reversed", (True, True): "mirrored + reversed",
 }
+
+
+def debug_number(value: float) -> float | str:
+    return round(value, 6) if math.isfinite(value) else str(value)
+
+
 # The brain also feels its own speed (signed, scaled by top speed): without it
 # a network cannot tell how hard to brake for a bend it is approaching.
 EXTRA_INPUTS = 1
-# Every brain also drives PROBE_COUNT probe roads per heat. They are drawn from the
-# hard roads (PROBE_MIN_LEVEL and up) in any orientation, whatever road the gauntlet
-# is on. Training only on easy roads first teaches "always full speed"; measured over
-# an hour of training, hard probes from the start lift the average share of a lap a
-# champion drives on 22 test roads from about 14.5 to about 19.
-PROBE_COUNT = 2
-PROBE_MIN_LEVEL = 5
+PPO_WORKERS = 10
+PPO_ROLLOUT_STEPS = 256
+PPO_CLEAN_RUNS_PER_ROAD = 5
 # A car that does not gain STAGNATION_DISTANCE px of forward progress for
 # STAGNATION_SECONDS is out. Without this, a network can drive in circles (or back
 # and forth) on the road forever: it never crashes, so a champion doing it is never
@@ -241,7 +239,7 @@ class Track:
 
     @property
     def art(self) -> pygame.Surface:
-        """Drawn on first use: probe roads are only driven, never shown."""
+        """Draw the road art only when this road is shown."""
         if self._art is None:
             self._art = self._make_art()
         return self._art
@@ -348,15 +346,15 @@ class Car:
     steering: float = 0.0
     drive: float = 0.0
     brake: float = 0.0
+    death_reason: str | None = None
+    enforce_progress_timeout: bool = True
     sensor_noise: float = SENSOR_NOISE
     progress_mark: float = 0.0  # best_progress when it last moved forward enough
     mark_time: float = 0.0
 
     @property
     def rank_key(self) -> tuple[int, float, float]:
-        if self.fastest_lap is not None:
-            return 1, -self.fastest_lap, self.best_progress
-        return 0, self.best_progress, min(self.time, 10) * 0.05
+        return self.laps_completed, self.best_progress, -(self.fastest_lap or float("inf"))
 
     def lap_score(self, track: Track) -> float:
         """Points for finished laps only: lap points plus a pace bonus per lap."""
@@ -373,7 +371,11 @@ class Car:
     def update(self, track: Track, dt: float) -> None:
         if not self.alive:
             return
-        self.time += dt
+        self.observe(track)
+        self.move(track, dt, self.brain.forward(self.inputs))
+
+    def observe(self, track: Track) -> list[float]:
+        """Read the same sensors for either evolutionary or PPO control."""
         self.sensors = track.sense(self.x, self.y, self.angle, self.brain.sizes[0] - EXTRA_INPUTS)
         if self.sensor_noise:
             # Noisy eyes stop networks memorising exact distances on one road.
@@ -382,7 +384,14 @@ class Car:
                 for value in self.sensors
             ]
         self.inputs = self.sensors + [self.speed / TOP_SPEED] * EXTRA_INPUTS
-        self.steering, self.drive, self.brake = self.brain.forward(self.inputs)
+        return self.inputs
+
+    def move(self, track: Track, dt: float, controls: tuple[float, float, float]) -> None:
+        """Apply network controls and advance the car by one physics step."""
+        if not self.alive:
+            return
+        self.time += dt
+        self.steering, self.drive, self.brake = controls
         # Drive is signed: negative accelerates backwards. Brake always acts
         # against the current motion and cannot reverse the car by itself.
         self.speed += 200 * self.drive * dt
@@ -400,13 +409,16 @@ class Car:
         self.y += math.sin(self.angle) * self.speed * dt
         if not track.on_road(self.x, self.y):
             self.alive = False
+            self.death_reason = "left_road"
             return
         position, self.nearest = track.progress(self.x, self.y, self.nearest)
         previous_progress = self.progress
         current = self.progress % track.length
         delta = (position - current + track.length / 2) % track.length - track.length / 2
-        if -15 < delta < 15:
-            self.progress += delta
+        # The nearby-segment projection can move more than 15 px through a
+        # tight bend. Rejecting it leaves progress permanently behind the car.
+        # Track.progress keeps the projection local; unwrap the finish line here.
+        self.progress += delta
         while self.progress >= (self.laps_completed + 1) * track.length:
             finish_distance = (self.laps_completed + 1) * track.length
             finish_fraction = (finish_distance - previous_progress) / (self.progress - previous_progress)
@@ -420,20 +432,22 @@ class Car:
         if self.best_progress > self.progress_mark + STAGNATION_DISTANCE:
             self.progress_mark = self.best_progress
             self.mark_time = self.time
-        elif self.time - self.mark_time > STAGNATION_SECONDS:
+        elif self.enforce_progress_timeout and self.time - self.mark_time > STAGNATION_SECONDS:
             self.alive = False
+            self.death_reason = "no_forward_progress"
         if self.time > 4.0 and self.distance_travelled < 10:
             self.alive = False
+            self.death_reason = self.death_reason or "barely_moved"
         if self.time > 8.0 and abs(self.speed) < 3:
             self.alive = False
+            self.death_reason = self.death_reason or "stalled"
 
 
 class Race:
     """Runs heats and tracks the champion through the gauntlet.
 
-    The champion (slot 0 of every generation) must finish 5 laps on each road
-    in turn, 10 on the final road, then faces random roads. A crash or a
-    clearly better challenger crowns a new champion and restarts at road 1.
+    A car can finish a road after five laps. The champion (slot 0) carries its
+    gauntlet progress forward; a crash or clearly better challenger restarts it.
     """
 
     def __init__(
@@ -441,8 +455,9 @@ class Race:
         max_runtime: int = DEFAULT_MAX_RUNTIME, time_limit_enabled: bool = True,
         seed_networks: list[Network] | None = None, record_tracks: int = 0,
         save_path: Path | None = None, best_score: float = 0.0,
-        record_brain: Network | None = None,
+        record_brain: Network | None = None, population: int = POPULATION,
     ) -> None:
+        self.population = population
         self.track = track
         self.rng = random.Random()
         self.inputs = inputs
@@ -451,6 +466,7 @@ class Race:
         self.time_limit_enabled = time_limit_enabled
         self.sizes = (inputs + EXTRA_INPUTS, *hidden, 3)
         self.generation = 1
+        self.restart_level = 1
         self.elapsed = 0.0
         self.best_ever = 0.0
         self.fastest_ever: float | None = None
@@ -470,15 +486,15 @@ class Race:
         self.record_brain = record_brain or (seed_networks[0] if seed_networks else None)
         # Slots only mean something once a generation was bred from ranked parents.
         self.roles_known = bool(seed_networks)
-        self.last_result: tuple[str, str] | None = None  # who won the previous generation
+        self.last_result: tuple[str, ...] | None = None  # result and exact end reason
+        self.transition_history: list[dict] = []
         self._tracks = {(track.level, track.mirror, track.reverse): track}
-        self.probes: list[tuple[Track, list[Car]]] = []
         if seed_networks:
             ranked = [((0, -index, 0.0), network) for index, network in enumerate(seed_networks)]
-            brains = next_generation(ranked, self.rng, POPULATION)
+            brains = next_generation(ranked, self.rng, self.population)
             self.champion = brains[0]
         else:
-            brains = [Network.random(self.sizes, self.rng) for _ in range(POPULATION)]
+            brains = [Network.random(self.sizes, self.rng) for _ in range(self.population)]
         self._spawn(brains)
 
     def _make_cars(self, track: Track, brains: list[Network]) -> list[Car]:
@@ -496,19 +512,7 @@ class Race:
 
     def _spawn(self, brains: list[Network]) -> None:
         self.cars = self._make_cars(self.track, brains)
-        self.probes = [(track, self._make_cars(track, brains)) for track in self._choose_probes()]
         self.elapsed = 0.0
-
-    def _choose_probes(self) -> list[Track]:
-        """Hard roads, in random orientations, that every car also drives this heat."""
-        current = (self.track.level, self.track.mirror, self.track.reverse)
-        low = min(PROBE_MIN_LEVEL, len(ROAD_SPECS))
-        picks: list[tuple[int, bool, bool]] = []
-        while len(picks) < PROBE_COUNT:
-            other = (self.rng.randint(low, len(ROAD_SPECS)), *self.rng.choice(ORIENTATIONS))
-            if other != current and other not in picks:
-                picks.append(other)
-        return [self.track_for(*pick) for pick in picks]
 
     def track_for(self, level: int, mirror: bool = False, reverse: bool = False) -> Track:
         key = (level, mirror, reverse)
@@ -517,20 +521,12 @@ class Race:
         return self._tracks[key]
 
     def fitness(self, index: int) -> float:
-        """How well brain `index` drove the shown road and every probe road.
-
-        Distance is scaled to the same units on every road. The score blends the
-        average with the worst road, so a brain must cope with all of them.
-        """
-        reference = REFERENCE_SPEED * self.heat_limit
-        values = [self.cars[index].best_progress / reference]
-        values += [cars[index].best_progress / reference for _, cars in self.probes]
-        mean = sum(values) / len(values)
-        return FITNESS_MEAN_WEIGHT * mean + (1 - FITNESS_MEAN_WEIGHT) * min(values)
+        """Scale a car's best distance on the displayed road for selection."""
+        return self.cars[index].best_progress / (REFERENCE_SPEED * self.heat_limit)
 
     @property
     def laps_required(self) -> int:
-        return FINAL_ROAD_LAPS if self.track.level == len(ROAD_SPECS) else LAPS_PER_ROAD
+        return LAPS_PER_ROAD
 
     @property
     def heat_limit(self) -> int:
@@ -572,7 +568,8 @@ class Race:
         car = self.champion_car
         if car is not None and car.alive:
             return car
-        return self.leader or self.best_car
+        living = [car for car in self.cars if car.alive]
+        return max(living, key=lambda car: car.rank_key) if living else self.best_car
 
     def save_now(self) -> None:
         """Write the record-setting model and score if the record is not saved yet."""
@@ -587,6 +584,7 @@ class Race:
     def change_track(self, track: Track) -> None:
         """Jump to another road: the heat restarts and the gauntlet begins there."""
         self.track = track
+        self.restart_level = track.level
         self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
         self.fastest_ever = None
@@ -599,9 +597,6 @@ class Race:
         self.elapsed += dt
         for car in self.cars:
             car.update(self.track, dt)
-        for track, cars in self.probes:
-            for car in cars:
-                car.update(track, dt)
         self.best_ever = max(self.best_ever, *(car.best_progress for car in self.cars))
         for car in self.cars:
             if car.fastest_lap is not None:
@@ -614,52 +609,86 @@ class Race:
             self.best_score_ever = self.current_score
             self.record_tracks = self.tracks_completed
             self.record_brain = self.scoring_car.brain
-        goal = self.champion is not None and self.champion_laps >= self.laps_required
+        finishers = [index for index, car in enumerate(self.cars)
+                     if car.alive and car.laps_completed >= self.laps_required]
+        goal = bool(finishers)
         time_expired = self.time_limit_enabled and self.elapsed >= self.heat_limit
-        anyone_alive = any(car.alive for car in self.cars) or any(
-            car.alive for _, cars in self.probes for car in cars
-        )
+        anyone_alive = any(car.alive for car in self.cars)
         if goal or time_expired or not anyone_alive:
-            self._end_heat(goal)
+            reason = "five_laps_completed" if goal else "max_runtime" if time_expired else "all_cars_stopped"
+            self._end_heat(goal, reason, finishers)
 
-    def _end_heat(self, goal: bool) -> None:
+    def _end_heat(self, goal: bool, reason: str, finishers: list[int]) -> None:
+        leader = self.leader
+        leader_index = next((index for index, car in enumerate(self.cars) if car is leader), None)
+        transition = {
+            "reason": reason,
+            "generation_before": self.generation,
+            "road_before": self.track.level,
+            "elapsed_seconds": debug_number(self.elapsed),
+            "time_limit_enabled": self.time_limit_enabled,
+            "max_runtime_seconds": self.max_runtime,
+            "heat_limit_seconds": self.heat_limit,
+            "lap_target": self.laps_required,
+            "alive_count": sum(car.alive for car in self.cars),
+            "finisher_indices": finishers[:],
+            "finishers_before": [self._car_debug(index) for index in finishers],
+            "champion_laps_before": self.champion_laps,
+            "champion_before": self._car_debug(0) if self.champion is not None else None,
+            "leader_before": self._car_debug(leader_index) if leader_index is not None else None,
+            "top_cars_before": [self._car_debug(index) for index in sorted(
+                range(len(self.cars)), key=lambda index: self.cars[index].best_progress,
+                reverse=True,
+            )[:5]],
+        }
         fitness = [self.fitness(index) for index in range(len(self.cars))]
         ranked = [((value,), car.brain) for value, car in zip(fitness, self.cars)]
         self.history.append(max(car.best_progress for car in self.cars))
         self.history = self.history[-40:]
-        brains = next_generation(ranked, self.rng, POPULATION)
+        brains = next_generation(ranked, self.rng, self.population)
         self.save_now()
         champion_car = self.champion_car
         winner_index = max(range(len(self.cars)), key=fitness.__getitem__)
         if self.roles_known:
-            winner_text = HOW_MADE[slot_role(winner_index, POPULATION)]
+            winner_text = HOW_MADE[slot_role(winner_index, self.population)]
         else:
             winner_text = "a random starting network"
         headline = f"Generation {self.generation} was won by {winner_text}."
-        next_track = self.track_for(1)
+        next_track = self.track_for(self.restart_level)
         if champion_car is None:
             self.champion = brains[0]
             self._reset_gauntlet()
-            outcome = "It is the first champion; the run starts on road 1."
+            if goal and winner_index in finishers:
+                self.run_banked = self.cars[winner_index].lap_score(self.track)
+                self.tracks_completed = 1
+                if self.track.level == len(ROAD_SPECS):
+                    self.random_phase = True
+                    next_track = self.track_for(
+                        self.rng.randint(1, len(ROAD_SPECS)), *self.rng.choice(ORIENTATIONS))
+                else:
+                    next_track = self.track_for(self.track.level + 1)
+                outcome = f"The first champion finished five laps; next is road {next_track.level}."
+            else:
+                outcome = f"It is the first champion; the run starts on road {self.restart_level}."
         else:
-            crashed = not champion_car.alive and not goal
-            # A challenger must be clearly fitter over all roads to take the title.
+            crashed = not champion_car.alive
+            # A challenger must be clearly fitter on this road to take the title.
             beaten = fitness[winner_index] > fitness[0] * (1 + BEAT_MARGIN) and winner_index != 0
             if crashed or beaten:
-                # Crash, or a clearly better car: new champion, back to road 1.
+                # Restart from the road chosen manually, or road 1 by default.
                 self.champion = brains[0]
                 self._reset_gauntlet()
                 outcome = (
-                    "The champion crashed, so the best car of the heat is the new champion; back to road 1."
+                    f"The champion crashed, so the best car of the heat is the new champion; back to road {self.restart_level}."
                     if crashed else
-                    "It beat the champion by enough to take over; back to road 1."
+                    f"It beat the champion by enough to take over; back to road {self.restart_level}."
                 )
             else:
                 outcome = "The champion keeps its title."
                 brains[0] = self.champion  # the champion always survives unchanged
                 next_track = self.track  # laps are still owed on this road
                 self.run_banked += champion_car.lap_score(self.track)
-                if goal:
+                if champion_car.alive and self.champion_laps >= self.laps_required:
                     self.tracks_completed += 1
                     self.laps_banked = 0
                     outcome = f"The champion finished road {self.track.level} and has now completed {self.tracks_completed}."
@@ -680,17 +709,340 @@ class Race:
         self._spawn(brains)
         self.generation += 1
         self.roles_known = True
-        self.last_result = (headline, outcome)
+        reason_text = {
+            "five_laps_completed": "Five laps completed",
+            "max_runtime": "Time limit reached",
+            "all_cars_stopped": "All cars stopped",
+        }[reason]
+        self.last_result = (headline, outcome, f"Generation ended: {reason_text}.")
         self.current_score = self.run_score
+        transition.update({
+            "winner_index": winner_index,
+            "winner_fitness": debug_number(fitness[winner_index]),
+            "generation_after": self.generation,
+            "road_after": self.track.level,
+            "outcome": outcome,
+        })
+        self.transition_history.append(transition)
+        self.transition_history = self.transition_history[-20:]
+
+    def _car_debug(self, index: int) -> dict:
+        car = self.cars[index]
+        return {
+            "index": index,
+            "alive": car.alive,
+            "death_reason": car.death_reason,
+            "laps_completed": car.laps_completed,
+            "progress": debug_number(car.progress),
+            "best_progress": debug_number(car.best_progress),
+            "time_seconds": debug_number(car.time),
+            "speed": debug_number(car.speed),
+        }
 
     @property
     def leader(self) -> Car | None:
         living = [car for car in self.cars if car.alive]
-        return max(living, key=lambda car: car.rank_key) if living else None
+        return max(living, key=lambda car: car.progress) if living else None
 
     @property
     def best_car(self) -> Car:
         return max(self.cars, key=lambda car: car.rank_key)
+
+
+class PPORace:
+    """Train one shared PPO policy with every worker driving the displayed road."""
+
+    algorithm = "ppo"
+
+    def __init__(
+        self, track: Track, inputs: int, hidden: list[int], max_runtime: int,
+        time_limit_enabled: bool, checkpoint_path: Path, resume: bool = True,
+        population: int = PPO_WORKERS,
+    ) -> None:
+        import numpy as np
+        from ppo import PPOAgent
+
+        self.population = population
+        self.np = np
+        self.track = track
+        self.inputs = inputs
+        self.hidden = hidden[:]
+        self.sizes = (inputs + EXTRA_INPUTS, *hidden, 3)
+        self.max_runtime = max_runtime
+        self.time_limit_enabled = time_limit_enabled
+        self.checkpoint_path = checkpoint_path
+        self.rng = random.Random()
+        self.agent = (PPOAgent.load(checkpoint_path, self.sizes) if resume else None) or PPOAgent(self.sizes)
+        self.policy_network = self.agent.export_network()
+        self._saved_updates = self.agent.updates
+        self._tracks = {(track.level, track.mirror, track.reverse): track}
+        self.worker_tracks: list[Track] = [track] * self.population
+        self.worker_cars: list[Car] = []
+        self.worker_obs: list[list[float]] = []
+        self.worker_returns = [0.0] * self.population
+        self.clean_runs_on_road = 0
+        self.cars: list[Car] = []
+        for index in range(self.population):
+            self._reset_worker(index)
+        self.cars = self.worker_cars
+        self.rollout: list[dict[str, np.ndarray]] = []
+        self.generation = 1  # one generation is one group of cars on the road
+        self.episodes = 0
+        self.recent_returns: list[float] = []
+        self.current_crash_events: list[dict] = []
+        self.transition_history: list[dict] = []
+        self.best_ever = 0.0
+        self.fastest_ever: float | None = None
+        self.elapsed = 0.0
+        self.last_result: tuple[str, ...] | None = None
+
+    def track_for(self, level: int, mirror: bool, reverse: bool) -> Track:
+        key = level, mirror, reverse
+        if key not in self._tracks:
+            self._tracks[key] = Track(*key)
+        return self._tracks[key]
+
+    def _new_car(self, track: Track, index: int) -> Car:
+        # Every car starts on the same start line, spread across its width.
+        x, y = track.points[0]
+        nx, ny = track.points[1]
+        angle = math.atan2(ny - y, nx - x)
+        px, py = -math.sin(angle), math.cos(angle)
+        offset = (
+            (index - (self.population - 1) / 2)
+            * track.widths[0] * 0.8 / (self.population - 1)
+        )
+        car = Car(
+            self.policy_network, x + px * offset, y + py * offset,
+            angle + self.rng.uniform(-START_ANGLE_JITTER, START_ANGLE_JITTER),
+            enforce_progress_timeout=False,
+        )
+        return car
+
+    def _reset_worker(self, index: int, track: Track | None = None) -> None:
+        if track is None:
+            track = self.track
+        self.worker_tracks[index] = track
+        car = self._new_car(track, index)
+        observation = car.observe(track)
+        if index < len(self.worker_cars):
+            self.worker_cars[index] = car
+            self.worker_obs[index] = observation
+        else:
+            self.worker_cars.append(car)
+            self.worker_obs.append(observation)
+        self.worker_returns[index] = 0.0
+
+    @property
+    def heat_limit(self) -> int:
+        return max(FINAL_ROAD_RUNTIME, self.max_runtime) if self.track.level == len(ROAD_SPECS) else self.max_runtime
+
+    @property
+    def leader(self) -> Car | None:
+        living = [car for car in self.cars if car.alive]
+        # Current progress follows the car's real position, even after reversing.
+        return max(living, key=lambda car: car.progress) if living else None
+
+    @property
+    def best_car(self) -> Car:
+        return self.leader or max(self.cars, key=lambda car: car.rank_key)
+
+    @property
+    def mean_reward(self) -> float:
+        return sum(self.recent_returns) / len(self.recent_returns) if self.recent_returns else 0.0
+
+    def _car_debug(self, index: int) -> dict:
+        car = self.worker_cars[index]
+        number = debug_number
+        return {
+            "index": index,
+            "alive": car.alive,
+            "death_reason": car.death_reason,
+            "position": [number(car.x), number(car.y)],
+            "heading_radians": number(car.angle),
+            "time_seconds": number(car.time),
+            "speed": number(car.speed),
+            "laps_completed": car.laps_completed,
+            "progress": number(car.progress),
+            "best_progress": number(car.best_progress),
+            "progress_mark": number(car.progress_mark),
+            "seconds_since_progress_mark": number(car.time - car.mark_time),
+            "distance_travelled": number(car.distance_travelled),
+            "steering": number(car.steering),
+            "drive": number(car.drive),
+            "brake": number(car.brake),
+            "sensors": [number(value) for value in car.sensors],
+        }
+
+    def _transition_debug(self, reason: str) -> dict:
+        leader = self.leader
+        return {
+            "reason": reason,
+            "generation_before": self.generation,
+            "road_before": self.track.level,
+            "road_name_before": self.track.name,
+            "elapsed_seconds": debug_number(max(car.time for car in self.worker_cars)),
+            "ppo_updates": self.agent.updates,
+            "clean_runs_before": self.clean_runs_on_road,
+            "leader_index_before": next(
+                (index for index, car in enumerate(self.worker_cars) if car is leader), None,
+            ),
+            "cars_before": [self._car_debug(index) for index in range(self.population)],
+            "crash_events": self.current_crash_events[:],
+        }
+
+    def _record_transition(self, transition: dict) -> None:
+        transition.update({
+            "generation_after": self.generation,
+            "road_after": self.track.level,
+            "clean_runs_after": self.clean_runs_on_road,
+            "episodes_after": self.episodes,
+        })
+        self.transition_history.append(transition)
+        self.transition_history = self.transition_history[-20:]
+        self.current_crash_events.clear()
+
+    def _advance(self, indices: list[int], dt: float, collect: bool) -> None:
+        np = self.np
+        active = [index for index in indices if self.worker_cars[index].alive]
+        if not active:
+            return
+        active_observations = np.asarray([self.worker_obs[index] for index in active], dtype=np.float32)
+        actions, active_raw, active_logp, active_values = self.agent.act(active_observations)
+        observations = np.zeros((self.population, self.sizes[0]), dtype=np.float32)
+        raw_actions = np.zeros((self.population, self.sizes[-1]), dtype=np.float32)
+        logp = np.zeros(self.population, dtype=np.float32)
+        values = np.zeros(self.population, dtype=np.float32)
+        rewards = np.zeros(self.population, dtype=np.float32)
+        dones = np.ones(self.population, dtype=np.float32)
+        next_values = np.zeros(self.population, dtype=np.float32)
+        valid = np.zeros(self.population, dtype=bool)
+        post_observations: dict[int, list[float]] = {}
+        for row, index in enumerate(active):
+            car, track = self.worker_cars[index], self.worker_tracks[index]
+            valid[index] = True
+            observations[index] = active_observations[row]
+            raw_actions[index] = active_raw[row]
+            logp[index] = active_logp[row]
+            values[index] = active_values[row]
+            before_progress, before_laps = car.progress, car.laps_completed
+            car.move(track, dt, tuple(float(value) for value in actions[row]))
+            rewards[index] = (car.progress - before_progress) / 100.0 - 0.002
+            rewards[index] += max(0, car.laps_completed - before_laps)
+            if not car.alive:
+                rewards[index] -= 2.0
+                self.current_crash_events.append(self._car_debug(index))
+            else:
+                post_observations[index] = car.observe(track)
+            self.worker_returns[index] += float(rewards[index])
+            self.best_ever = max(self.best_ever, car.best_progress)
+            if car.fastest_lap is not None:
+                self.fastest_ever = (
+                    car.fastest_lap if self.fastest_ever is None
+                    else min(self.fastest_ever, car.fastest_lap)
+                )
+        if post_observations:
+            post_indices = list(post_observations)
+            post_values = self.agent.value(np.asarray(
+                [post_observations[index] for index in post_indices], dtype=np.float32,
+            ))
+            for index, value in zip(post_indices, post_values):
+                next_values[index] = value
+        leader = self.leader
+        clean_round = leader is not None and leader.laps_completed >= LAPS_PER_ROAD
+        group_finished = clean_round or leader is None
+        if clean_round:
+            self.clean_runs_on_road += 1
+        switch_road = clean_round and self.clean_runs_on_road >= PPO_CLEAN_RUNS_PER_ROAD
+        for index in active:
+            car = self.worker_cars[index]
+            if not car.alive or group_finished:
+                self.recent_returns.append(self.worker_returns[index])
+                self.recent_returns = self.recent_returns[-40:]
+                self.episodes += 1
+            else:
+                dones[index] = 0.0
+                self.worker_obs[index] = post_observations[index]
+        if group_finished:
+            transition = self._transition_debug(
+                "five_laps_completed" if clean_round else "all_cars_stopped"
+            )
+            finished_generation = self.generation
+            self.generation += 1
+            if switch_road:
+                next_level = self.track.level % len(ROAD_SPECS) + 1
+                self.track = self.track_for(next_level, False, False)
+                self.clean_runs_on_road = 0
+                self.best_ever = 0.0
+                self.fastest_ever = None
+            reason = "leader completed five laps" if clean_round else "all cars were eliminated"
+            self.last_result = (
+                f"PPO generation {finished_generation} ended: {reason}.",
+                f"Clean runs: {self.clean_runs_on_road}/{PPO_CLEAN_RUNS_PER_ROAD} on road {self.track.level}.",
+            )
+            self._record_transition(transition)
+            for index in range(self.population):
+                self._reset_worker(index)
+        if collect:
+            self.rollout.append({
+                "observations": observations,
+                "raw_actions": raw_actions,
+                "logp": logp,
+                "values": values,
+                "rewards": rewards,
+                "dones": dones,
+                "next_values": next_values,
+                "valid": valid,
+            })
+        self.elapsed = max(car.time for car in self.worker_cars)
+
+    def update(self, dt: float) -> None:
+        if self.agent.optimizing:
+            # Keep all visible cars moving while gradients are applied.
+            self._advance(list(range(self.population)), dt, collect=False)
+            if self.agent.train_minibatch():
+                self.policy_network = self.agent.export_network()
+                for car in self.worker_cars:
+                    car.brain = self.policy_network
+                if self.agent.updates % 5 == 0:
+                    self.save_now()
+            return
+        self._advance(list(range(self.population)), dt, collect=True)
+        if len(self.rollout) >= PPO_ROLLOUT_STEPS:
+            self.agent.begin_update(self.rollout)
+            self.rollout.clear()
+
+    def change_track(self, track: Track) -> None:
+        transition = self._transition_debug("manual_road_change")
+        self.track = track
+        self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
+        self.best_ever = 0.0
+        self.fastest_ever = None
+        self.clean_runs_on_road = 0
+        self.rollout.clear()
+        self.generation += 1
+        self.last_result = (f"PPO group moved to road {track.level}.",)
+        self._record_transition(transition)
+        for index in range(self.population):
+            self._reset_worker(index, track)
+        self.elapsed = 0.0
+
+    def save_now(self) -> None:
+        if self.agent.optimizing:
+            # A checkpoint must contain a completed PPO update; the rollout
+            # batch itself is deliberately not part of the saved file.
+            while not self.agent.train_minibatch():
+                pass
+            self.policy_network = self.agent.export_network()
+            for car in self.worker_cars:
+                car.brain = self.policy_network
+        if self.agent.updates <= self._saved_updates:
+            return
+        try:
+            self.agent.save(self.checkpoint_path)
+        except OSError:
+            return
+        self._saved_updates = self.agent.updates
 
 
 class App:
@@ -707,11 +1059,16 @@ class App:
         self.bold = pygame.font.SysFont("Avenir Next", 20, bold=True)
         self.title = pygame.font.SysFont("Avenir Next", 32, bold=True)
         self.save_path = save_path or SAVE_PATH
-        self.settings_path = self.save_path.with_name("settings.json")
+        self.settings_path = self.save_path.with_name("app_settings.json")
+        self.debug_path = self.save_path.with_name("debug_snapshot.json")
+        settings = self._read_settings()
+        self.ppo_topology = self._valid_topology(settings.get("ppo"))
+        self.car_count = self._valid_car_count(settings.get("evolution_cars"), POPULATION)
+        self.ppo_population = self._valid_car_count(settings.get("ppo_cars"), PPO_WORKERS)
         self.inputs = 7
         self.hidden = [DEFAULT_HIDDEN_WIDTH, DEFAULT_HIDDEN_WIDTH]
         self.max_runtime = DEFAULT_MAX_RUNTIME
-        self.time_limit_enabled = True
+        self.time_limit_enabled = False  # Evolution runs until five laps or every car stops.
         self.paused = False
         self.speed = 4
         self.show_sensors = True
@@ -721,14 +1078,14 @@ class App:
         if saved:
             seed, record_tracks, best_score = saved.networks, saved.tracks_completed, saved.best_score
             self.inputs, self.hidden = seed[0].sizes[0] - EXTRA_INPUTS, list(seed[0].sizes[1:-1])
-        settings = self._load_settings()
-        if settings is not None:
-            self.inputs = settings["inputs"]
-            self.hidden = settings["hidden"]
-            self.max_runtime = settings["max_runtime"]
-            self.time_limit_enabled = settings["time_limit_enabled"]
-            self.speed = settings["speed"]
-            self.show_sensors = settings["show_sensors"]
+        preferences = self._load_settings(settings)
+        if preferences is not None:
+            self.inputs = preferences["inputs"]
+            self.hidden = preferences["hidden"]
+            self.max_runtime = preferences["max_runtime"]
+            self.time_limit_enabled = preferences["time_limit_enabled"]
+            self.speed = preferences["speed"]
+            self.show_sensors = preferences["show_sensors"]
             if seed and seed[0].sizes != (self.inputs + EXTRA_INPUTS, *self.hidden, 3):
                 seed = None
         self.road_level = 1  # the gauntlet always starts on road 1
@@ -736,14 +1093,101 @@ class App:
         self.race = Race(
             self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
             seed, record_tracks, self.save_path, best_score,
-            record_brain=saved.networks[0] if saved else None,
+            record_brain=saved.networks[0] if saved else None, population=self.car_count,
         )
+        self.algorithm = "evolution"
+        self.evolution_race = self.race
+        self.ppo_race: PPORace | None = None
+        self.ppo_path = self.save_path.with_name("ppo_checkpoint.pt")
+        self.algorithm_menu_open = False
         self.buttons: list[tuple[pygame.Rect, str]] = []
         self.inspector: NetworkInspector | None = None
+        self.debug_notice: str | None = None
+        self.debug_notice_until = 0
+        if settings.get("algorithm") == "ppo":
+            self.select_algorithm("ppo", remember=False)
 
-    def _load_settings(self) -> dict | None:
+    def _read_settings(self) -> dict:
+        # Preserve preferences from the pre-PPO settings file during migration.
+        settings = {}
+        for path in (self.save_path.with_name("settings.json"), self.settings_path):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    settings.update(payload)
+            except (OSError, ValueError):
+                continue
+        return settings
+
+    @staticmethod
+    def _valid_car_count(value: object, default: int) -> int:
+        return value if type(value) is int and 5 <= value <= 200 and value % 5 == 0 else default
+
+    @staticmethod
+    def _valid_topology(payload: object) -> tuple[int, list[int]] | None:
+        if not isinstance(payload, dict):
+            return None
+        inputs, hidden = payload.get("inputs"), payload.get("hidden")
+        if (type(inputs) is int and 3 <= inputs <= 15 and isinstance(hidden, list)
+                and 1 <= len(hidden) <= 5
+                and all(type(width) is int and 2 <= width <= 24 for width in hidden)):
+            return inputs, hidden[:]
+        return None
+
+    def _save_settings(self) -> None:
+        if self.ppo_race is not None:
+            self.ppo_topology = self.ppo_race.inputs, self.ppo_race.hidden[:]
+        payload = {
+            "algorithm": self.algorithm,
+            "evolution_cars": self.evolution_race.population,
+            "ppo_cars": self.ppo_race.population if self.ppo_race else self.ppo_population,
+            "inputs": self.evolution_race.inputs, "hidden": self.evolution_race.hidden,
+            "max_runtime": self.max_runtime,
+            "time_limit_enabled": self.evolution_race.time_limit_enabled,
+            "speed": self.speed, "show_sensors": self.show_sensors,
+        }
+        if self.ppo_topology is not None:
+            payload["ppo"] = {"inputs": self.ppo_topology[0], "hidden": self.ppo_topology[1]}
+        temporary = self.settings_path.with_suffix(".json.tmp")
         try:
-            settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(self.settings_path)
+        except OSError:
+            pass
+
+    def select_algorithm(self, algorithm: str, remember: bool = True) -> None:
+        self.algorithm_menu_open = False
+        if algorithm == self.algorithm:
+            return
+        self.race.save_now()
+        if algorithm == "ppo":
+            self.evolution_race = self.race
+            if self.ppo_race is None:
+                inputs, hidden = self.ppo_topology or (self.inputs, self.hidden)
+                self.ppo_race = PPORace(
+                    Track(1), inputs, hidden, self.max_runtime,
+                    False, self.ppo_path, population=self.ppo_population,
+                )
+            self.race = self.ppo_race
+        elif algorithm == "evolution":
+            self.ppo_race = self.race
+            self.race = self.evolution_race
+        else:
+            raise ValueError(f"Unknown algorithm: {algorithm}")
+        self.algorithm = algorithm
+        self.track = self.race.track
+        self.road_level = self.track.level
+        self.inputs = self.race.inputs
+        self.hidden = self.race.hidden[:]
+        self.car_count = self.race.population
+        self.max_runtime = self.race.max_runtime
+        self.time_limit_enabled = self.race.time_limit_enabled
+        self.paused = False
+        if remember:
+            self._save_settings()
+
+    def _load_settings(self, settings: dict) -> dict | None:
+        try:
             if not isinstance(settings, dict):
                 return None
             integers = {"inputs": (3, 15), "max_runtime": (5, 120)}
@@ -764,24 +1208,25 @@ class App:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def _save_settings(self) -> None:
-        settings = {
-            "inputs": self.inputs, "hidden": self.hidden,
-            "max_runtime": self.max_runtime, "time_limit_enabled": self.time_limit_enabled,
-            "speed": self.speed, "show_sensors": self.show_sensors,
-        }
-        temporary = self.settings_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(self.settings_path)
-
     def _restart_training(self, resume: bool = True) -> None:
         self.road_level = 1
         self.track = Track(self.road_level)
-        self.race = Race(
-            self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
-            record_tracks=self.race.record_tracks, save_path=self.save_path,
-            best_score=self.race.best_score_ever, record_brain=self.race.record_brain,
-        )
+        if self.algorithm == "ppo":
+            self.race = PPORace(
+                self.track, self.inputs, self.hidden, self.max_runtime,
+                False, self.ppo_path, resume=False, population=self.car_count,
+            )
+            self.ppo_race = self.race
+            self.ppo_topology = self.inputs, self.hidden[:]
+            self.ppo_population = self.car_count
+        else:
+            self.race = Race(
+                self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
+                record_tracks=self.race.record_tracks, save_path=self.save_path,
+                best_score=self.race.best_score_ever, record_brain=self.race.record_brain,
+                population=self.car_count,
+            )
+            self.evolution_race = self.race
         if resume:
             self.paused = False
 
@@ -799,24 +1244,125 @@ class App:
         self.screen.blit(rendered, rendered.get_rect(center=rect.center))
         self.buttons.append((rect, action))
 
-    def stepper(self, y: int, caption: str, value: int, key: str) -> None:
+    def stepper(self, y: int, caption: str, value: int, key: str, height: int = 27) -> None:
         x = WORLD_W + 23
         self.label(caption, x, y, MUTED, self.small)
-        self.button(pygame.Rect(WIDTH - 122, y - 1, 26, 27), "−", f"{key}:-")
+        self.button(pygame.Rect(WIDTH - 122, y - 1, 26, height), "−", f"{key}:-")
         value_text = self.font.render(str(value), True, TEXT)
-        self.screen.blit(value_text, value_text.get_rect(center=(WIDTH - 77, y + 13)))
-        self.button(pygame.Rect(WIDTH - 50, y - 1, 26, 27), "+", f"{key}:+")
+        self.screen.blit(value_text, value_text.get_rect(center=(WIDTH - 77, y + height // 2)))
+        self.button(pygame.Rect(WIDTH - 50, y - 1, 26, height), "+", f"{key}:+")
+
+    def _debug_car(self, index: int, car: Car) -> dict:
+        number = debug_number
+        return {
+            "index": index,
+            "alive": car.alive,
+            "death_reason": car.death_reason,
+            "position": [number(car.x), number(car.y)],
+            "heading_radians": number(car.angle),
+            "speed": number(car.speed),
+            "time_seconds": number(car.time),
+            "laps_completed": car.laps_completed,
+            "progress": number(car.progress),
+            "best_progress": number(car.best_progress),
+            "steering": number(car.steering),
+            "drive": number(car.drive),
+            "brake": number(car.brake),
+            "sensors": [number(value) for value in car.sensors],
+            "network_sizes": list(car.brain.sizes),
+        }
+
+    def debug_snapshot(self) -> dict:
+        race = self.race
+        leader = race.leader
+        data = {
+            "schema_version": 1,
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "app": {
+                "algorithm": self.algorithm,
+                "paused": self.paused,
+                "speed_multiplier": self.speed,
+                "max_runtime_seconds": self.max_runtime,
+                "time_limit_enabled": self.time_limit_enabled,
+                "selected_inputs": self.inputs,
+                "selected_hidden_layers": self.hidden[:],
+            },
+            "road": {
+                "level": race.track.level,
+                "name": race.track.name,
+                "mirrored": race.track.mirror,
+                "reversed": race.track.reverse,
+                "length": debug_number(race.track.length),
+            },
+            "race": {
+                "elapsed_seconds": debug_number(race.elapsed),
+                "alive_count": sum(car.alive for car in race.cars),
+                "last_result": list(race.last_result) if race.last_result else None,
+            },
+            "cars": [self._debug_car(index, car) for index, car in enumerate(race.cars)],
+            "evolution_recent_transitions": self.evolution_race.transition_history[-20:],
+            "ppo_recent_transitions": self.ppo_race.transition_history[-20:] if self.ppo_race else [],
+            "ppo_current_crash_events": self.ppo_race.current_crash_events[:] if self.ppo_race else [],
+        }
+        if isinstance(race, Race):
+            data["race"].update({
+                "generation": race.generation,
+                "restart_road": race.restart_level,
+                "lap_target": race.laps_required,
+                "champion_laps": race.champion_laps,
+                "champion_alive": race.champion_car.alive if race.champion_car else None,
+                "leader_index": next((i for i, car in enumerate(race.cars) if car is leader), None),
+                "tracks_completed": race.tracks_completed,
+                "best_distance": debug_number(race.best_ever),
+                "run_score": debug_number(race.current_score),
+                "best_score_ever": debug_number(race.best_score_ever),
+            })
+        else:
+            data["race"].update({
+                "generation": race.generation,
+                "generation_end_condition": "leader_five_laps_or_all_crashed",
+                "lap_target": LAPS_PER_ROAD,
+                "leader_index": next((i for i, car in enumerate(race.cars) if car is leader), None),
+                "ppo_updates": race.agent.updates,
+                "ppo_episodes": race.episodes,
+                "clean_runs_on_road": race.clean_runs_on_road,
+                "mean_reward": debug_number(race.mean_reward),
+                "rollout_steps": len(race.rollout),
+                "optimizing": race.agent.optimizing,
+                "policy_loss": debug_number(race.agent.policy_loss),
+                "value_loss": debug_number(race.agent.value_loss),
+            })
+        return data
+
+    def write_debug_snapshot(self) -> None:
+        temporary = self.debug_path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(self.debug_snapshot(), indent=2, allow_nan=False) + "\n", encoding="utf-8")
+            temporary.replace(self.debug_path)
+            self.debug_notice = f"Saved {self.debug_path.name}"
+        except (OSError, ValueError, TypeError):
+            self.debug_notice = "Could not save debug snapshot"
+        self.debug_notice_until = pygame.time.get_ticks() + 4000
 
     def handle_action(self, action: str) -> None:
         if action == "pause":
             self.paused = not self.paused
         elif action == "speed":
             self.speed = {1: 2, 2: 4, 4: 8, 8: 1}[self.speed]
+        elif action == "debug":
+            self.write_debug_snapshot()
         elif action == "limit":
+            if self.algorithm == "ppo":
+                self.debug_notice = "PPO resets after five laps or when all cars are out."
+                self.debug_notice_until = pygame.time.get_ticks() + 4000
+                return
             self.time_limit_enabled = not self.time_limit_enabled
             self.race.time_limit_enabled = self.time_limit_enabled
+        elif action in ("algorithm", "algorithm:menu"):
+            self.algorithm_menu_open = not self.algorithm_menu_open
+        elif action in ("algorithm:evolution", "algorithm:ppo"):
+            self.select_algorithm(action.split(":", 1)[1])
         elif action == "apply":
-            # A fresh start on road 1; the saved file is only replaced by a new record.
             self._restart_training()
         elif action == "inspect":
             if self.inspector is None:
@@ -833,6 +1379,11 @@ class App:
             elif key == "runtime":
                 self.max_runtime = max(5, min(120, self.max_runtime + 5 * change))
                 self.race.max_runtime = self.max_runtime
+                self.evolution_race.max_runtime = self.max_runtime
+                if self.ppo_race is not None:
+                    self.ppo_race.max_runtime = self.max_runtime
+            elif key == "cars":
+                self.car_count = max(5, min(200, self.car_count + 5 * change))
             elif key == "inputs":
                 self.inputs = max(3, min(15, self.inputs + change))
             elif key == "layers":
@@ -843,7 +1394,8 @@ class App:
             elif key.startswith("hidden"):
                 index = int(key[6:])
                 self.hidden[index] = max(2, min(24, self.hidden[index] + change))
-            if self.inputs != self.race.inputs or self.hidden != self.race.hidden:
+            if (self.inputs != self.race.inputs or self.hidden != self.race.hidden
+                    or self.car_count != self.race.population):
                 self._restart_training(resume=False)
         self._save_settings()
 
@@ -861,30 +1413,41 @@ class App:
                 continue
             forward = (math.cos(car.angle), math.sin(car.angle))
             side = (-forward[1], forward[0])
+            nose, tail, half_width = (8, 6, 3) if self.algorithm == "ppo" else (11, 8, 5)
             points = [
-                (car.x + forward[0] * 11, car.y + forward[1] * 11),
-                (car.x - forward[0] * 8 + side[0] * 5, car.y - forward[1] * 8 + side[1] * 5),
-                (car.x - forward[0] * 8 - side[0] * 5, car.y - forward[1] * 8 - side[1] * 5),
+                (car.x + forward[0] * nose, car.y + forward[1] * nose),
+                (car.x - forward[0] * tail + side[0] * half_width,
+                 car.y - forward[1] * tail + side[1] * half_width),
+                (car.x - forward[0] * tail - side[0] * half_width,
+                 car.y - forward[1] * tail - side[1] * half_width),
             ]
             color = ACCENT if car is leader else ORANGE
-            pygame.draw.polygon(self.screen, (9, 22, 27), points, 5)
+            pygame.draw.polygon(self.screen, (9, 22, 27), points, 3 if self.algorithm == "ppo" else 5)
             pygame.draw.polygon(self.screen, color, points)
 
     def draw_world(self) -> None:
         self.screen.blit(self.track.art, (0, 0))
         self.draw_cars()
-        pygame.draw.rect(self.screen, (11, 22, 30), (22, 22, 233, 196), border_radius=12)
-        self.label("NEURAL CIRCUIT", 37, 32, ACCENT, self.small)
-        self.label(f"Generation {self.race.generation:02d}", 37, 56, TEXT, self.bold)
-        alive = sum(car.alive for car in self.race.cars)
-        self.label(f"{alive:02d} / {POPULATION} cars on track", 38, 84, MUTED, self.small)
-        self.label(f"Tracks completed: {self.race.tracks_completed}", 37, 108, ACCENT, self.font)
-        lap_text = f"Lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
-        self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), 38, 133, MUTED, self.small)
-        self.label(f"Run score: {self.race.current_score:,.0f}", 37, 160, ORANGE, self.font)
-        self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", 38, 186, MUTED, self.small)
-        probes = ", ".join(track.label for track, _ in self.race.probes)
-        lines = [*(self.race.last_result or ()), f"Every car is also tested on: {probes}"]
+        hud_x = WORLD_W - 255
+        pygame.draw.rect(self.screen, (11, 22, 30), (hud_x, 22, 233, 196), border_radius=12)
+        self.label("NEURAL CIRCUIT", hud_x + 15, 32, ACCENT, self.small)
+        if self.algorithm == "ppo":
+            self.label(f"PPO generation {self.race.generation:03d}", hud_x + 15, 56, TEXT, self.bold)
+            self.label(f"{sum(car.alive for car in self.race.cars)}/{self.race.population} PPO cars on this road", hud_x + 16, 84, MUTED, self.small)
+            self.label(f"Episodes: {self.race.episodes}", hud_x + 15, 108, ACCENT, self.font)
+            lines = [*(self.race.last_result or ()), "New group after five laps or when all cars are out."]
+        else:
+            self.label(f"Generation {self.race.generation:02d}", hud_x + 15, 56, TEXT, self.bold)
+            alive = sum(car.alive for car in self.race.cars)
+            self.label(f"{alive:02d} / {self.race.population} cars on track", hud_x + 16, 84, MUTED, self.small)
+            self.label(f"Tracks completed: {self.race.tracks_completed}", hud_x + 15, 108, ACCENT, self.font)
+            lap_text = f"Lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
+            self.label(lap_text + (" · random roads" if self.race.random_phase else " on this road"), hud_x + 16, 133, MUTED, self.small)
+            self.label(f"Run score: {self.race.current_score:,.0f}", hud_x + 15, 160, ORANGE, self.font)
+            self.label(f"Best score ever: {self.race.best_score_ever:,.0f}", hud_x + 16, 186, MUTED, self.small)
+            lines = [*(self.race.last_result or ()), "All cars train on the displayed road."]
+        if self.debug_notice and pygame.time.get_ticks() < self.debug_notice_until:
+            lines.append(self.debug_notice)
         top = HEIGHT - 66 - 21 * len(lines)
         pygame.draw.rect(self.screen, (11, 22, 30), (22, top - 6, 640, 21 * len(lines) + 10), border_radius=8)
         for row, line in enumerate(lines):
@@ -906,26 +1469,37 @@ class App:
         pygame.draw.line(self.screen, (52, 76, 78), (x, 0), (x, HEIGHT), 2)
         self.label("CONTROL ROOM", x + 23, 18, ACCENT, self.small)
         self.label("Train the drivers", x + 22, 39, TEXT, self.title)
-        self.label("Brains evolve after each race.", x + 24, 80, MUTED, self.small)
+        self.button(
+            pygame.Rect(x + 22, 77, 316, 27),
+            f"ALGORITHM: {self.algorithm.upper()}",
+            "algorithm:menu",
+        )
+        arrow = (
+            ((x + 316, 94), (x + 326, 94), (x + 321, 87))
+            if self.algorithm_menu_open else
+            ((x + 316, 87), (x + 326, 87), (x + 321, 94))
+        )
+        pygame.draw.polygon(self.screen, TEXT, arrow)
 
-        self.button(pygame.Rect(x + 22, 109, 146, 32), "RESUME" if self.paused else "PAUSE", "pause")
-        self.button(pygame.Rect(x + 177, 109, 160, 32), f"SPEED  {self.speed}×", "speed")
+        self.button(pygame.Rect(x + 22, 109, 96, 32), "RESUME" if self.paused else "PAUSE", "pause")
+        self.button(pygame.Rect(x + 126, 109, 102, 32), f"SPEED {self.speed}×", "speed")
+        self.button(pygame.Rect(x + 236, 109, 102, 32), "DEBUG", "debug")
         pygame.draw.line(self.screen, (46, 65, 72), (x + 22, 151), (WIDTH - 22, 151))
 
         alive = sum(car.alive for car in self.race.cars)
-        self.label("GENERATION", x + 23, 162, MUTED, self.tiny)
+        self.label("PPO UPDATES" if self.algorithm == "ppo" else "GENERATION", x + 23, 162, MUTED, self.tiny)
         best_label = "FASTEST LAP" if self.race.fastest_ever is not None else "BEST DISTANCE"
         self.label(best_label, x + 184, 162, MUTED, self.tiny)
-        self.label(str(self.race.generation), x + 23, 178, TEXT, self.bold)
+        self.label(str(self.race.agent.updates if self.algorithm == "ppo" else self.race.generation), x + 23, 178, TEXT, self.bold)
         best_value = (
             f"{self.race.fastest_ever:.2f} s" if self.race.fastest_ever is not None
             else f"{self.race.best_ever / 10:.0f} m"
         )
         self.label(best_value, x + 184, 178, TEXT, self.bold)
-        self.label("CARS RUNNING", x + 23, 215, MUTED, self.tiny)
-        self.label("LAPS", x + 184, 215, MUTED, self.tiny)
-        self.label(f"{alive} / {POPULATION}", x + 23, 231, TEXT, self.font)
-        self.label(f"{self.race.best_ever / self.track.length:.1f}", x + 184, 231, TEXT, self.font)
+        self.label("EPISODES" if self.algorithm == "ppo" else "CARS RUNNING", x + 23, 215, MUTED, self.tiny)
+        self.label("MEAN REWARD" if self.algorithm == "ppo" else "LAPS", x + 184, 215, MUTED, self.tiny)
+        self.label(str(self.race.episodes) if self.algorithm == "ppo" else f"{alive} / {self.race.population}", x + 23, 231, TEXT, self.font)
+        self.label(f"{self.race.mean_reward:+.1f}" if self.algorithm == "ppo" else f"{self.race.best_ever / self.track.length:.1f}", x + 184, 231, TEXT, self.font)
 
         pygame.draw.line(self.screen, (46, 65, 72), (x + 22, 263), (WIDTH - 22, 263))
         self.label("ROAD & RACE", x + 23, 274, ACCENT, self.small)
@@ -935,31 +1509,42 @@ class App:
         self.screen.blit(road_number, road_number.get_rect(center=(x + 180, 317)))
         road_name = self.small.render(self.track.name, True, MUTED)
         self.screen.blit(road_name, road_name.get_rect(center=(x + 180, 345)))
-        auto_text = (
-            f"Tracks completed: {self.race.tracks_completed}  •  "
-            f"lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
-            + ("  •  random roads" if self.race.random_phase else "")
-        )
+        if self.algorithm == "ppo":
+            auto_text = (
+                f"Clean runs: {self.race.clean_runs_on_road}/"
+                f"{PPO_CLEAN_RUNS_PER_ROAD} to next road"
+            )
+        else:
+            auto_text = (
+                f"Tracks completed: {self.race.tracks_completed}  •  "
+                f"lap {min(self.race.champion_laps, self.race.laps_required)}/{self.race.laps_required}"
+                + ("  •  random roads" if self.race.random_phase else "")
+            )
         self.label(auto_text, x + 23, 357, MUTED, self.tiny)
-        self.stepper(374, "Max runtime (seconds)", self.max_runtime, "runtime")
-        self.button(
-            pygame.Rect(x + 22, 407, 133, 27),
-            "LIMIT ON" if self.time_limit_enabled else "LIMIT OFF", "limit",
-            primary=not self.time_limit_enabled,
-        )
-        heat_text = (
-            f"Heat {self.race.elapsed:.1f} / {self.race.heat_limit} s"
-            if self.time_limit_enabled else f"Heat {self.race.elapsed:.1f} s"
-        )
-        self.label(heat_text, x + 166, 411, MUTED, self.small)
+        self.stepper(374, "Max runtime (Evolution)" if self.algorithm == "ppo" else "Max runtime (seconds)", self.max_runtime, "runtime")
+        if self.algorithm == "ppo":
+            self.button(pygame.Rect(x + 22, 407, 133, 27), "5 LAP RULE", "limit", primary=True)
+            self.label(f"Heat {self.race.elapsed:.1f} s", x + 166, 411, MUTED, self.small)
+        else:
+            self.button(
+                pygame.Rect(x + 22, 407, 133, 27),
+                "LIMIT ON" if self.time_limit_enabled else "LIMIT OFF", "limit",
+                primary=not self.time_limit_enabled,
+            )
+            heat_text = (
+                f"Heat {self.race.elapsed:.1f} / {self.race.heat_limit} s"
+                if self.time_limit_enabled else f"Heat {self.race.elapsed:.1f} s"
+            )
+            self.label(heat_text, x + 166, 411, MUTED, self.small)
 
         pygame.draw.line(self.screen, (46, 65, 72), (x + 22, 443), (WIDTH - 22, 443))
         self.label("NETWORK SETUP", x + 23, 451, ACCENT, self.small)
-        self.stepper(477, "Input neurons / sensors", self.inputs, "inputs")
-        self.stepper(509, "Hidden layers", len(self.hidden), "layers")
-        self.label("NEURONS IN EACH HIDDEN LAYER", x + 23, 543, MUTED, self.tiny)
+        self.stepper(477, "Cars (steps of 5)", self.car_count, "cars")
+        self.stepper(509, "Input neurons / sensors", self.inputs, "inputs")
+        self.stepper(541, "Hidden layers", len(self.hidden), "layers")
+        self.label("NEURONS IN EACH HIDDEN LAYER", x + 23, 575, MUTED, self.tiny)
         for i, size in enumerate(self.hidden):
-            self.stepper(563 + i * 29, f"Layer {i + 1}", size, f"hidden{i}")
+            self.stepper(594 + i * 23, f"Layer {i + 1}", size, f"hidden{i}", height=21)
 
         self.label("OUTPUTS", x + 23, 711, MUTED, self.tiny)
         self.label("steer: L/R  •  drive: F/R  •  brake: slow/stop", x + 23, 727, TEXT, self.small)
@@ -969,6 +1554,13 @@ class App:
             pygame.Rect(x + 184, 755, 154, 38),
             "APPLY & RESTART" if dirty else "RESTART TRAINING", "apply", primary=True,
         )
+        if self.algorithm_menu_open:
+            pygame.draw.rect(self.screen, (46, 65, 73), (x + 20, 105, 320, 62), border_radius=8)
+            for row, (algorithm, title) in enumerate((("evolution", "EVOLUTION"), ("ppo", "PPO"))):
+                self.button(
+                    pygame.Rect(x + 23, 108 + row * 28, 314, 27),
+                    title, f"algorithm:{algorithm}", primary=self.algorithm == algorithm,
+                )
 
     def run(self) -> None:
         running = True
@@ -1003,10 +1595,14 @@ class App:
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if window_id not in (None, self.main_window_id):
                         continue
-                    for rect, action in self.buttons:
+                    clicked = False
+                    for rect, action in reversed(self.buttons):
                         if rect.collidepoint(event.pos):
                             self.handle_action(action)
+                            clicked = True
                             break
+                    if not clicked:
+                        self.algorithm_menu_open = False
 
             if not self.paused:
                 for _ in range(self.speed):

@@ -5,3 +5,9 @@ best_network.json
 best_network.json.tmp
 settings.json
 settings.json.tmp
+ppo_checkpoint.pt
+ppo_checkpoint.pt.tmp
+app_settings.json
+app_settings.json.tmp
+debug_snapshot.json
+debug_snapshot.json.tmp

@@ -168,7 +168,7 @@ class Network:
 
 
 def newcomer_count(population: int) -> int:
-    return max(2, population // 10)
+    return min(max(2, population // 10), population - 4)
 
 
 def slot_role(index: int, population: int) -> str:

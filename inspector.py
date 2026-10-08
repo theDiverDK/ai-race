@@ -93,17 +93,19 @@ class NetworkInspector:
         ):
             self.selected = None
         self.surface.fill(BG)
-        self._text("BEST CAR NETWORK", 26, 17, POSITIVE, self.title)
+        is_ppo = getattr(race, "algorithm", "evolution") == "ppo"
+        self._text("PPO POLICY NETWORK" if is_ppo else "BEST CAR NETWORK", 26, 17, POSITIVE, self.title)
         state = "paused" if paused else ("driving" if car.alive else "stopped")
         result = (
             f"fastest lap {car.fastest_lap:.2f} s" if car.fastest_lap is not None
             else f"progress {car.best_progress / race.track.length:.2f} laps"
         )
         self._text(
-            f"Generation {race.generation}  |  {result}  |  {state}  |  "
+            f"{'PPO update' if is_ppo else 'Generation'} {race.generation - 1 if is_ppo else race.generation}  |  {result}  |  {state}  |  "
             f"speed {car.speed:.1f}  |  {len(brain.sizes)} layers", 28, 53, MUTED, self.font,
         )
-        self._text("Green: positive weight    Orange: negative weight    Brighter: stronger", 28, 77, MUTED)
+        legend = "Policy mean; driving also samples exploration.  " if is_ppo else ""
+        self._text(legend + "Green: positive    Orange: negative", 28, 77, MUTED)
 
         left, right = 65, 720
         top, bottom = 139, 742
