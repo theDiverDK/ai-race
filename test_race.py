@@ -205,6 +205,79 @@ class RaceTests(unittest.TestCase):
                 app.run()
         handle_action.assert_any_call("inspect")
 
+    def test_network_controls_update_cars_and_open_inspector_immediately(self):
+        app = App()
+        app.paused = True
+        app.handle_action("inspect")
+        self.addCleanup(app.inspector.close)
+        for _ in range(3):
+            app.handle_action("layers:+")
+        for _ in range(8):
+            app.handle_action("inputs:+")
+        app.handle_action("hidden4:+")
+        self.assertEqual(app.race.sizes, (16, 16, 16, 16, 16, 17, 3))
+        self.assertTrue(app.paused)
+        app.race.update(1 / 60)
+        self.assertTrue(all(len(car.sensors) == 15 for car in app.race.cars))
+        for _, cars in app.race.probes:
+            self.assertTrue(all(car.brain.sizes == app.race.sizes for car in cars))
+        app.inspector.draw(app.race, app.paused)
+        self.assertEqual([len(layer) for layer in app.inspector.positions], list(app.race.sizes))
+        app.inspector.selected = (5, 16)
+        app.inspector.draw(app.race, app.paused)
+        self.assertEqual(app.inspector.selected, (5, 16))
+        app.draw_world()
+        app.draw_panel()
+        # All five layer controls and both bottom buttons remain visible/clickable.
+        for rect, _ in app.buttons:
+            self.assertTrue(app.screen.get_rect().contains(rect))
+        app.handle_action("layers:-")
+        app.inspector.draw(app.race, app.paused)
+        self.assertIsNone(app.inspector.selected)
+
+    def test_selected_settings_survive_relaunch_and_override_old_model_design(self):
+        old = Network.random((6, 6, 4, 3), random.Random(10))
+        save_networks(self.save_path, [old], 7, 123.0)
+        app = App()
+        app.handle_action("inputs:+")
+        app.handle_action("layers:+")
+        app.handle_action("hidden2:+")
+        app.handle_action("runtime:+")
+        app.handle_action("limit")
+        app.handle_action("speed")
+        app.show_sensors = False
+        app._save_settings()
+        restarted = App()
+        self.assertEqual((restarted.inputs, restarted.hidden), (6, [6, 4, 17]))
+        self.assertEqual(restarted.race.sizes, (7, 6, 4, 17, 3))
+        self.assertEqual(restarted.max_runtime, 30)
+        self.assertFalse(restarted.time_limit_enabled)
+        self.assertEqual(restarted.speed, 8)
+        self.assertFalse(restarted.show_sensors)
+        self.assertIsNone(restarted.race.champion)
+        self.assertEqual(restarted.race.best_score_ever, 123.0)
+        self.assertEqual(restarted.race.record_brain.weights, old.weights)
+        self.assertEqual(load_networks(self.save_path).networks[0].weights, old.weights)
+
+    def test_matching_saved_model_resumes_with_persisted_settings(self):
+        brain = Network.random((6, 6, 4, 3), random.Random(11))
+        save_networks(self.save_path, [brain], 7)
+        app = App()
+        app.handle_action("runtime:+")
+        restarted = App()
+        self.assertEqual(restarted.race.cars[0].brain.weights, brain.weights)
+        self.assertIsNotNone(restarted.race.champion)
+        self.assertEqual(restarted.max_runtime, 30)
+
+    def test_invalid_settings_fall_back_without_crashing(self):
+        settings_path = self.save_path.with_name("settings.json")
+        for data in ("not json", "null", "[]", '{}',
+                     '{"inputs": true}',
+                     '{"inputs": 7, "max_runtime": 25, "hidden": [0]}'):
+            settings_path.write_text(data)
+            app = App()
+            self.assertEqual((app.inputs, app.hidden), (7, [16, 16]))
+
     def test_no_time_limit_waits_for_last_car(self):
         race = Race(Track(1), 7, [8], max_runtime=5, time_limit_enabled=False)
         for car in race.cars[1:]:

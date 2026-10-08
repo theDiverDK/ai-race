@@ -38,7 +38,8 @@ Tests set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`, so they run headl
 - `slot_role()` in `neural.py` must match how `next_generation()` orders cars (2 elites, 2 mutants, children, newcomers): `Race` uses it to say how the winner was made (`Race.last_result`).
 - Cars die by leaving the road, stalling (speed < 3 after 8 s), or stagnating (`STAGNATION_DISTANCE` of `best_progress` per `STAGNATION_SECONDS`). Stagnation matters: a champion that circles or oscillates on the road never crashes, is never replaced, and freezes the run. Reversing with no forward progress dies after 4 s by design.
 - Sensor noise (`SENSOR_NOISE`) and start-heading jitter are deliberate anti-overfitting measures; set `Car.sensor_noise = 0` when a test needs deterministic sensors.
-- Switching roads restarts the heat but keeps the networks. **Apply & Restart** and `R` start a new population.
+- Switching roads restarts the heat but keeps the networks. Changing sensor count, hidden-layer count or widths immediately starts a new population on Road 1 and preserves the pause state. **Restart Training** and `R` also start a new population.
+- `App` saves network settings, runtime/limit, speed and sensor visibility to `settings.json` beside its `save_path`, restoring them before constructing the race. Settings take precedence over the saved model architecture; only matching models seed the population, while the score/model record is retained. Tests isolate both save files through the temporary `SAVE_PATH`.
 - The UI palette constants (`BG`, `PANEL`, `TEXT`, `MUTED` and so on) are duplicated in `main.py` and `inspector.py`. Keep them in sync.
 - The code is plain Python with type hints and no framework. Match the existing style, and keep changes small and self-contained.
 - If you change controls or behaviour, update `README.md` and the tests in the same change.

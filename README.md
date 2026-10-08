@@ -22,12 +22,14 @@ python main.py
 | Road arrows, or left/right arrow keys | Switch among eleven roads. Roads 1, 2, 10, and 11 keep their original layouts. Roads 3–9 have tighter turns that reward braking before a bend, and Roads 6–10 include narrow sections. Switching restarts the current heat on the new road while keeping the networks, and restarts the gauntlet there. |
 | Max runtime `−` / `+` | Set a heat's time limit from 5 to 120 simulated seconds. Changes take effect immediately. |
 | **Limit On / Limit Off** | Turn the time limit on or off. With it off, the heat continues until every car has left the road, stalled or stopped making progress. |
-| Input neurons, hidden layers, layer widths | Change the network design. Click **Apply & Restart** to start a new population with those settings. The output layer always has three neurons. |
+| Input neurons, hidden layers, layer widths | Changes immediately start a new population with the selected design on Road 1, updating the sensor rays and the open network viewer. Supports up to five hidden layers. The output layer always has three neurons. |
 | **Pause** / `P` | Pause or resume. |
-| **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Starts at 4×. |
+| **Speed** / `Tab` | Cycle through 1×, 2×, 4×, and 8× simulation speed. Defaults to 4×; your selection is restored on the next launch. |
 | `V` | Show or hide the leading car's sensor rays. |
 | `R` | Restart training with the current settings. |
 | **View Network** | Open a live window for the highest scoring car in the current generation. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its current activation, bias, weighted input, and exact incoming and outgoing connection weights. Scroll the details pane for longer lists. |
+
+Sensor count, hidden-layer count and widths, runtime limit, limit toggle, simulation speed, and sensor visibility are saved automatically in `settings.json` beside `best_network.json`. They are restored on the next launch. A saved best model resumes only when its architecture matches the selected settings; otherwise training starts with the selected design while keeping the best score and model record. Missing or invalid settings fall back to the saved model's design or the defaults.
 
 ## How learning works
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -706,27 +707,83 @@ class App:
         self.bold = pygame.font.SysFont("Avenir Next", 20, bold=True)
         self.title = pygame.font.SysFont("Avenir Next", 32, bold=True)
         self.save_path = save_path or SAVE_PATH
+        self.settings_path = self.save_path.with_name("settings.json")
         self.inputs = 7
         self.hidden = [DEFAULT_HIDDEN_WIDTH, DEFAULT_HIDDEN_WIDTH]
         self.max_runtime = DEFAULT_MAX_RUNTIME
         self.time_limit_enabled = True
+        self.paused = False
+        self.speed = 4
+        self.show_sensors = True
         # Resume from the saved champions when possible, otherwise start from scratch.
         saved = load_networks(self.save_path)
         seed, record_tracks, best_score = None, 0, 0.0
         if saved:
             seed, record_tracks, best_score = saved.networks, saved.tracks_completed, saved.best_score
             self.inputs, self.hidden = seed[0].sizes[0] - EXTRA_INPUTS, list(seed[0].sizes[1:-1])
+        settings = self._load_settings()
+        if settings is not None:
+            self.inputs = settings["inputs"]
+            self.hidden = settings["hidden"]
+            self.max_runtime = settings["max_runtime"]
+            self.time_limit_enabled = settings["time_limit_enabled"]
+            self.speed = settings["speed"]
+            self.show_sensors = settings["show_sensors"]
+            if seed and seed[0].sizes != (self.inputs + EXTRA_INPUTS, *self.hidden, 3):
+                seed = None
         self.road_level = 1  # the gauntlet always starts on road 1
         self.track = Track(self.road_level)
         self.race = Race(
             self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
             seed, record_tracks, self.save_path, best_score,
+            record_brain=saved.networks[0] if saved else None,
         )
-        self.paused = False
-        self.speed = 4
-        self.show_sensors = True
         self.buttons: list[tuple[pygame.Rect, str]] = []
         self.inspector: NetworkInspector | None = None
+
+    def _load_settings(self) -> dict | None:
+        try:
+            settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                return None
+            integers = {"inputs": (3, 15), "max_runtime": (5, 120)}
+            for key, (low, high) in integers.items():
+                value = settings[key]
+                if type(value) is not int or not low <= value <= high:
+                    return None
+            hidden = settings["hidden"]
+            if not isinstance(hidden, list) or not 1 <= len(hidden) <= 5:
+                return None
+            if any(type(size) is not int or not 2 <= size <= 24 for size in hidden):
+                return None
+            if type(settings["speed"]) is not int or settings["speed"] not in (1, 2, 4, 8):
+                return None
+            if any(type(settings[key]) is not bool for key in ("time_limit_enabled", "show_sensors")):
+                return None
+            return settings
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _save_settings(self) -> None:
+        settings = {
+            "inputs": self.inputs, "hidden": self.hidden,
+            "max_runtime": self.max_runtime, "time_limit_enabled": self.time_limit_enabled,
+            "speed": self.speed, "show_sensors": self.show_sensors,
+        }
+        temporary = self.settings_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self.settings_path)
+
+    def _restart_training(self, resume: bool = True) -> None:
+        self.road_level = 1
+        self.track = Track(self.road_level)
+        self.race = Race(
+            self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
+            record_tracks=self.race.record_tracks, save_path=self.save_path,
+            best_score=self.race.best_score_ever, record_brain=self.race.record_brain,
+        )
+        if resume:
+            self.paused = False
 
     def label(self, text: str, x: int, y: int, color=TEXT, font=None) -> None:
         self.screen.blit((font or self.font).render(text, True, color), (x, y))
@@ -760,14 +817,7 @@ class App:
             self.race.time_limit_enabled = self.time_limit_enabled
         elif action == "apply":
             # A fresh start on road 1; the saved file is only replaced by a new record.
-            self.road_level = 1
-            self.track = Track(self.road_level)
-            self.race = Race(
-                self.track, self.inputs, self.hidden, self.max_runtime, self.time_limit_enabled,
-                record_tracks=self.race.record_tracks, save_path=self.save_path,
-                best_score=self.race.best_score_ever, record_brain=self.race.record_brain,
-            )
-            self.paused = False
+            self._restart_training()
         elif action == "inspect":
             if self.inspector is None:
                 self.inspector = NetworkInspector()
@@ -793,6 +843,9 @@ class App:
             elif key.startswith("hidden"):
                 index = int(key[6:])
                 self.hidden[index] = max(2, min(24, self.hidden[index] + change))
+            if self.inputs != self.race.inputs or self.hidden != self.race.hidden:
+                self._restart_training(resume=False)
+        self._save_settings()
 
     def draw_cars(self) -> None:
         leader = self.race.leader
@@ -940,6 +993,7 @@ class App:
                         self.handle_action("apply")
                     elif event.key == pygame.K_v:
                         self.show_sensors = not self.show_sensors
+                        self._save_settings()
                     elif event.key == pygame.K_TAB:
                         self.handle_action("speed")
                     elif event.key == pygame.K_LEFT:
@@ -969,6 +1023,7 @@ class App:
         if self.inspector:
             self.inspector.close()
         self.race.save_now()
+        self._save_settings()
         pygame.quit()
 
 
