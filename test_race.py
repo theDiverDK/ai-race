@@ -36,11 +36,11 @@ class RaceTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_distinct_drivable_roads_with_both_turns_and_pinches(self):
-        self.assertEqual(len(ROAD_SPECS), 11)
-        tracks = [Track(level) for level in range(1, 12)]
+        self.assertEqual(len(ROAD_SPECS), 12)
+        tracks = [Track(level) for level in range(1, 13)]
         self.assertEqual(tracks[0].points[0], (215, 155))
         self.assertEqual(set(tracks[0].widths), {104})
-        self.assertEqual(len({tuple(track.points[:2]) for track in tracks}), 11)
+        self.assertEqual(len({tuple(track.points[:2]) for track in tracks}), 12)
         self.assertEqual([track.road_width for track in tracks], sorted(
             (track.road_width for track in tracks), reverse=True
         ))
@@ -86,6 +86,18 @@ class RaceTests(unittest.TestCase):
         for left in (130, 240, 350, 460, 570):
             self.assertFalse(track.on_road(left + 55, 400))
         self.assertTrue(track.on_road(350, 735))
+
+    def test_hairpin_maze_has_vertical_and_horizontal_hairpins_without_merging_lanes(self):
+        track = Track(12)
+        self.assertEqual(track.name, "Hairpin Maze")
+        self.assertEqual(track.points[0], (400, 735))
+        for x in (185, 295):  # between the vertical legs
+            self.assertFalse(track.on_road(x, 400))
+        for y in (165, 275, 385, 495):  # between the horizontal legs
+            self.assertFalse(track.on_road(660, y))
+        for point in ((130, 400), (240, 400), (350, 400), (660, 110), (660, 220),
+                      (660, 330), (660, 440), (660, 550), (855, 385), (465, 495)):
+            self.assertTrue(track.on_road(*point), point)
 
     def test_middle_roads_have_bends_tighter_than_full_speed_turning(self):
         full_speed_turn_radius = 220 / (1.25 + 0.005 * 220)
@@ -548,7 +560,7 @@ class RaceTests(unittest.TestCase):
 
     def test_final_road_needs_five_laps_then_random_roads(self):
         race = self.crowned_race()
-        race.change_track(Track(11))
+        race.change_track(Track(len(ROAD_SPECS)))
         self.assertEqual((race.laps_required, race.heat_limit), (5, 60))
         with self.gauntlet(race, laps_per_heat=4):
             race.update(0.01)
@@ -803,7 +815,7 @@ class RaceTests(unittest.TestCase):
 
     def test_random_phase_shows_random_orientations(self):
         race = self.crowned_race()
-        race.change_track(Track(11))
+        race.change_track(Track(len(ROAD_SPECS)))
         seen = set()
         with self.gauntlet(race, laps_per_heat=10):
             for _ in range(60):
