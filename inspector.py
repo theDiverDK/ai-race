@@ -53,9 +53,6 @@ class NetworkInspector:
 
     def handle_event(self, event: pygame.event.Event) -> bool:
         """Return false when the inspector's close button was pressed."""
-        window = getattr(event, "window", None)
-        if getattr(window, "id", window) != self.window.id:
-            return True
         if event.type == pygame.WINDOWCLOSE:
             return False
         if event.type == pygame.MOUSEMOTION:

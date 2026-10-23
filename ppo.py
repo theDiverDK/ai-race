@@ -100,10 +100,7 @@ class PPOAgent:
             following = delta + gamma * gae_lambda * (1.0 - dones[t]) * following
             advantages[t] = following
         returns = advantages + values
-        valid = np.stack([
-            step["valid"] if "valid" in step else np.ones_like(step["dones"], dtype=bool)
-            for step in rollout
-        ]).reshape(-1)
+        valid = np.stack([step["valid"] for step in rollout]).reshape(-1)
         flat_advantages = advantages.reshape(-1)[valid]
         flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
         self._data = {

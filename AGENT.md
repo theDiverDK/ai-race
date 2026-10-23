@@ -56,6 +56,15 @@ Tests set `SDL_VIDEODRIVER=dummy` and `SDL_AUDIODRIVER=dummy`, so they run headl
 
 Measure changes on the displayed road and across the gauntlet over several seeds. The old benchmark that used hidden probe roads no longer applies. The gauntlet score alone is noisy and depends on how often champions are replaced.
 
+## Coding guidelines
+
+Follow the Karpathy guidelines (the `andrej-karpathy-skills` plugin is enabled in `.claude/settings.json`):
+
+- Think before coding. State assumptions, and if a request has more than one reading, ask instead of picking one silently. Say so when a simpler approach exists.
+- Simplicity first. Write the minimum code that solves the problem: no speculative features, configurability, or single-use abstractions, and no handling for impossible cases.
+- Make surgical changes. Every changed line should trace back to the request. Don't reformat or refactor neighbouring code. Remove only what your own change made unused, and mention other dead code rather than deleting it.
+- Be goal-driven. Turn each task into a check you can verify, preferably a test that fails first and then passes, and loop until it holds.
+
 ## Workflow
 
 - Run `python -m unittest -v` before finishing any change.

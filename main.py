@@ -121,13 +121,6 @@ def catmull_rom(points: list[tuple[float, float]], samples: int = 16) -> list[tu
     return result
 
 
-def draw_band(surface: pygame.Surface, points: list[tuple[float, float]], color, width: int) -> None:
-    """Draw overlapping round segments so thick curves have no square gaps."""
-    radius = width // 2
-    for x, y in points:
-        pygame.draw.circle(surface, color, (round(x), round(y)), radius)
-
-
 def draw_road_band(
     surface: pygame.Surface, points: list[tuple[float, float]],
     widths: list[int], color, padding: int = 0,
@@ -470,7 +463,6 @@ class Race:
         self.elapsed = 0.0
         self.best_ever = 0.0
         self.fastest_ever: float | None = None
-        self.history: list[float] = []
         self.cars: list[Car] = []
         self.champion: Network | None = None
         self.tracks_completed = 0
@@ -588,7 +580,6 @@ class Race:
         self._tracks.setdefault((track.level, track.mirror, track.reverse), track)
         self.best_ever = 0.0
         self.fastest_ever = None
-        self.history.clear()
         self._reset_gauntlet()
         self.last_result = None
         self._spawn([car.brain for car in self.cars])
@@ -643,8 +634,6 @@ class Race:
         }
         fitness = [self.fitness(index) for index in range(len(self.cars))]
         ranked = [((value,), car.brain) for value, car in zip(fitness, self.cars)]
-        self.history.append(max(car.best_progress for car in self.cars))
-        self.history = self.history[-40:]
         brains = next_generation(ranked, self.rng, self.population)
         self.save_now()
         champion_car = self.champion_car
@@ -705,7 +694,6 @@ class Race:
             self.track = next_track
             self.best_ever = 0.0
             self.fastest_ever = None
-            self.history.clear()
         self._spawn(brains)
         self.generation += 1
         self.roles_known = True
@@ -781,7 +769,6 @@ class PPORace:
         self.worker_obs: list[list[float]] = []
         self.worker_returns = [0.0] * self.population
         self.clean_runs_on_road = 0
-        self.cars: list[Car] = []
         for index in range(self.population):
             self._reset_worker(index)
         self.cars = self.worker_cars
@@ -832,10 +819,6 @@ class PPORace:
             self.worker_cars.append(car)
             self.worker_obs.append(observation)
         self.worker_returns[index] = 0.0
-
-    @property
-    def heat_limit(self) -> int:
-        return max(FINAL_ROAD_RUNTIME, self.max_runtime) if self.track.level == len(ROAD_SPECS) else self.max_runtime
 
     @property
     def leader(self) -> Car | None:
@@ -1172,8 +1155,6 @@ class App:
         elif algorithm == "evolution":
             self.ppo_race = self.race
             self.race = self.evolution_race
-        else:
-            raise ValueError(f"Unknown algorithm: {algorithm}")
         self.algorithm = algorithm
         self.track = self.race.track
         self.road_level = self.track.level
@@ -1358,7 +1339,7 @@ class App:
                 return
             self.time_limit_enabled = not self.time_limit_enabled
             self.race.time_limit_enabled = self.time_limit_enabled
-        elif action in ("algorithm", "algorithm:menu"):
+        elif action == "algorithm:menu":
             self.algorithm_menu_open = not self.algorithm_menu_open
         elif action in ("algorithm:evolution", "algorithm:ppo"):
             self.select_algorithm(action.split(":", 1)[1])
@@ -1378,7 +1359,6 @@ class App:
                 self.race.change_track(self.track)
             elif key == "runtime":
                 self.max_runtime = max(5, min(120, self.max_runtime + 5 * change))
-                self.race.max_runtime = self.max_runtime
                 self.evolution_race.max_runtime = self.max_runtime
                 if self.ppo_race is not None:
                     self.ppo_race.max_runtime = self.max_runtime
