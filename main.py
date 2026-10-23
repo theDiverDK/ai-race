@@ -22,6 +22,9 @@ FPS = 60
 POPULATION = 50
 DEFAULT_MAX_RUNTIME = 25
 DEFAULT_HIDDEN_WIDTH = 16
+INPUT_LIMITS = (3, 15)  # sensor rays
+LAYER_LIMITS = (1, 5)
+WIDTH_LIMITS = (2, 24)  # neurons per hidden layer
 SENSOR_RANGE = 175
 LAPS_PER_ROAD = 5
 FINAL_ROAD_RUNTIME = 60
@@ -53,6 +56,38 @@ ORIENTATION_NAMES = {
 
 def debug_number(value: float) -> float | str:
     return round(value, 6) if math.isfinite(value) else str(value)
+
+
+def car_debug(index: int, car: Car) -> dict:
+    number = debug_number
+    return {
+        "index": index,
+        "alive": car.alive,
+        "death_reason": car.death_reason,
+        "position": [number(car.x), number(car.y)],
+        "heading_radians": number(car.angle),
+        "time_seconds": number(car.time),
+        "speed": number(car.speed),
+        "laps_completed": car.laps_completed,
+        "progress": number(car.progress),
+        "best_progress": number(car.best_progress),
+        "progress_mark": number(car.progress_mark),
+        "seconds_since_progress_mark": number(car.time - car.mark_time),
+        "distance_travelled": number(car.distance_travelled),
+        "steering": number(car.steering),
+        "drive": number(car.drive),
+        "brake": number(car.brake),
+        "sensors": [number(value) for value in car.sensors],
+        "network_sizes": list(car.brain.sizes),
+    }
+
+
+def start_pose(track: Track) -> tuple[float, float, float, float, float]:
+    """Start point, heading, and the unit vector across the start line."""
+    x, y = track.points[0]
+    nx, ny = track.points[1]
+    angle = math.atan2(ny - y, nx - x)
+    return x, y, angle, -math.sin(angle), math.cos(angle)
 
 
 # The brain also feels its own speed (signed, scaled by top speed): without it
@@ -489,21 +524,15 @@ class Race:
             brains = [Network.random(self.sizes, self.rng) for _ in range(self.population)]
         self._spawn(brains)
 
-    def _make_cars(self, track: Track, brains: list[Network]) -> list[Car]:
-        x, y = track.points[0]
-        nx, ny = track.points[1]
-        base_angle = math.atan2(ny - y, nx - x)
-        px, py = -math.sin(base_angle), math.cos(base_angle)
-        start_spread = min(15, track.road_width * 0.18)
-        return [
+    def _spawn(self, brains: list[Network]) -> None:
+        x, y, base_angle, px, py = start_pose(self.track)
+        start_spread = min(15, self.track.road_width * 0.18)
+        self.cars = [
             Car(brain, x + px * self.rng.uniform(-start_spread, start_spread),
                 y + py * self.rng.uniform(-start_spread, start_spread),
                 base_angle + self.rng.uniform(-START_ANGLE_JITTER, START_ANGLE_JITTER))
             for brain in brains
         ]
-
-    def _spawn(self, brains: list[Network]) -> None:
-        self.cars = self._make_cars(self.track, brains)
         self.elapsed = 0.0
 
     def track_for(self, level: int, mirror: bool = False, reverse: bool = False) -> Track:
@@ -715,21 +744,12 @@ class Race:
         self.transition_history = self.transition_history[-20:]
 
     def _car_debug(self, index: int) -> dict:
-        car = self.cars[index]
-        return {
-            "index": index,
-            "alive": car.alive,
-            "death_reason": car.death_reason,
-            "laps_completed": car.laps_completed,
-            "progress": debug_number(car.progress),
-            "best_progress": debug_number(car.best_progress),
-            "time_seconds": debug_number(car.time),
-            "speed": debug_number(car.speed),
-        }
+        return car_debug(index, self.cars[index])
 
     @property
     def leader(self) -> Car | None:
         living = [car for car in self.cars if car.alive]
+        # Current progress follows the car's real position, even after reversing.
         return max(living, key=lambda car: car.progress) if living else None
 
     @property
@@ -764,7 +784,6 @@ class PPORace:
         self.policy_network = self.agent.export_network()
         self._saved_updates = self.agent.updates
         self._tracks = {(track.level, track.mirror, track.reverse): track}
-        self.worker_tracks: list[Track] = [track] * self.population
         self.worker_cars: list[Car] = []
         self.worker_obs: list[list[float]] = []
         self.worker_returns = [0.0] * self.population
@@ -783,18 +802,13 @@ class PPORace:
         self.elapsed = 0.0
         self.last_result: tuple[str, ...] | None = None
 
-    def track_for(self, level: int, mirror: bool, reverse: bool) -> Track:
-        key = level, mirror, reverse
-        if key not in self._tracks:
-            self._tracks[key] = Track(*key)
-        return self._tracks[key]
+    track_for = Race.track_for
+    leader = Race.leader
+    _car_debug = Race._car_debug
 
     def _new_car(self, track: Track, index: int) -> Car:
         # Every car starts on the same start line, spread across its width.
-        x, y = track.points[0]
-        nx, ny = track.points[1]
-        angle = math.atan2(ny - y, nx - x)
-        px, py = -math.sin(angle), math.cos(angle)
+        x, y, angle, px, py = start_pose(track)
         offset = (
             (index - (self.population - 1) / 2)
             * track.widths[0] * 0.8 / (self.population - 1)
@@ -806,12 +820,9 @@ class PPORace:
         )
         return car
 
-    def _reset_worker(self, index: int, track: Track | None = None) -> None:
-        if track is None:
-            track = self.track
-        self.worker_tracks[index] = track
-        car = self._new_car(track, index)
-        observation = car.observe(track)
+    def _reset_worker(self, index: int) -> None:
+        car = self._new_car(self.track, index)
+        observation = car.observe(self.track)
         if index < len(self.worker_cars):
             self.worker_cars[index] = car
             self.worker_obs[index] = observation
@@ -821,41 +832,12 @@ class PPORace:
         self.worker_returns[index] = 0.0
 
     @property
-    def leader(self) -> Car | None:
-        living = [car for car in self.cars if car.alive]
-        # Current progress follows the car's real position, even after reversing.
-        return max(living, key=lambda car: car.progress) if living else None
-
-    @property
     def best_car(self) -> Car:
         return self.leader or max(self.cars, key=lambda car: car.rank_key)
 
     @property
     def mean_reward(self) -> float:
         return sum(self.recent_returns) / len(self.recent_returns) if self.recent_returns else 0.0
-
-    def _car_debug(self, index: int) -> dict:
-        car = self.worker_cars[index]
-        number = debug_number
-        return {
-            "index": index,
-            "alive": car.alive,
-            "death_reason": car.death_reason,
-            "position": [number(car.x), number(car.y)],
-            "heading_radians": number(car.angle),
-            "time_seconds": number(car.time),
-            "speed": number(car.speed),
-            "laps_completed": car.laps_completed,
-            "progress": number(car.progress),
-            "best_progress": number(car.best_progress),
-            "progress_mark": number(car.progress_mark),
-            "seconds_since_progress_mark": number(car.time - car.mark_time),
-            "distance_travelled": number(car.distance_travelled),
-            "steering": number(car.steering),
-            "drive": number(car.drive),
-            "brake": number(car.brake),
-            "sensors": [number(value) for value in car.sensors],
-        }
 
     def _transition_debug(self, reason: str) -> dict:
         leader = self.leader
@@ -902,7 +884,7 @@ class PPORace:
         valid = np.zeros(self.population, dtype=bool)
         post_observations: dict[int, list[float]] = {}
         for row, index in enumerate(active):
-            car, track = self.worker_cars[index], self.worker_tracks[index]
+            car, track = self.worker_cars[index], self.track
             valid[index] = True
             observations[index] = active_observations[row]
             raw_actions[index] = active_raw[row]
@@ -1007,7 +989,7 @@ class PPORace:
         self.last_result = (f"PPO group moved to road {track.level}.",)
         self._record_transition(transition)
         for index in range(self.population):
-            self._reset_worker(index, track)
+            self._reset_worker(index)
         self.elapsed = 0.0
 
     def save_now(self) -> None:
@@ -1111,9 +1093,10 @@ class App:
         if not isinstance(payload, dict):
             return None
         inputs, hidden = payload.get("inputs"), payload.get("hidden")
-        if (type(inputs) is int and 3 <= inputs <= 15 and isinstance(hidden, list)
-                and 1 <= len(hidden) <= 5
-                and all(type(width) is int and 2 <= width <= 24 for width in hidden)):
+        if (type(inputs) is int and INPUT_LIMITS[0] <= inputs <= INPUT_LIMITS[1]
+                and isinstance(hidden, list) and LAYER_LIMITS[0] <= len(hidden) <= LAYER_LIMITS[1]
+                and all(type(width) is int and WIDTH_LIMITS[0] <= width <= WIDTH_LIMITS[1]
+                        for width in hidden)):
             return inputs, hidden[:]
         return None
 
@@ -1169,24 +1152,16 @@ class App:
 
     def _load_settings(self, settings: dict) -> dict | None:
         try:
-            if not isinstance(settings, dict):
+            if self._valid_topology(settings) is None:
                 return None
-            integers = {"inputs": (3, 15), "max_runtime": (5, 120)}
-            for key, (low, high) in integers.items():
-                value = settings[key]
-                if type(value) is not int or not low <= value <= high:
-                    return None
-            hidden = settings["hidden"]
-            if not isinstance(hidden, list) or not 1 <= len(hidden) <= 5:
-                return None
-            if any(type(size) is not int or not 2 <= size <= 24 for size in hidden):
+            if type(settings["max_runtime"]) is not int or not 5 <= settings["max_runtime"] <= 120:
                 return None
             if type(settings["speed"]) is not int or settings["speed"] not in (1, 2, 4, 8):
                 return None
             if any(type(settings[key]) is not bool for key in ("time_limit_enabled", "show_sensors")):
                 return None
             return settings
-        except (OSError, ValueError, KeyError, TypeError):
+        except KeyError:
             return None
 
     def _restart_training(self, resume: bool = True) -> None:
@@ -1233,26 +1208,6 @@ class App:
         self.screen.blit(value_text, value_text.get_rect(center=(WIDTH - 77, y + height // 2)))
         self.button(pygame.Rect(WIDTH - 50, y - 1, 26, height), "+", f"{key}:+")
 
-    def _debug_car(self, index: int, car: Car) -> dict:
-        number = debug_number
-        return {
-            "index": index,
-            "alive": car.alive,
-            "death_reason": car.death_reason,
-            "position": [number(car.x), number(car.y)],
-            "heading_radians": number(car.angle),
-            "speed": number(car.speed),
-            "time_seconds": number(car.time),
-            "laps_completed": car.laps_completed,
-            "progress": number(car.progress),
-            "best_progress": number(car.best_progress),
-            "steering": number(car.steering),
-            "drive": number(car.drive),
-            "brake": number(car.brake),
-            "sensors": [number(value) for value in car.sensors],
-            "network_sizes": list(car.brain.sizes),
-        }
-
     def debug_snapshot(self) -> dict:
         race = self.race
         leader = race.leader
@@ -1280,7 +1235,7 @@ class App:
                 "alive_count": sum(car.alive for car in race.cars),
                 "last_result": list(race.last_result) if race.last_result else None,
             },
-            "cars": [self._debug_car(index, car) for index, car in enumerate(race.cars)],
+            "cars": [car_debug(index, car) for index, car in enumerate(race.cars)],
             "evolution_recent_transitions": self.evolution_race.transition_history[-20:],
             "ppo_recent_transitions": self.ppo_race.transition_history[-20:] if self.ppo_race else [],
             "ppo_current_crash_events": self.ppo_race.current_crash_events[:] if self.ppo_race else [],
@@ -1365,15 +1320,15 @@ class App:
             elif key == "cars":
                 self.car_count = max(5, min(200, self.car_count + 5 * change))
             elif key == "inputs":
-                self.inputs = max(3, min(15, self.inputs + change))
+                self.inputs = max(INPUT_LIMITS[0], min(INPUT_LIMITS[1], self.inputs + change))
             elif key == "layers":
-                new_count = max(1, min(5, len(self.hidden) + change))
+                new_count = max(LAYER_LIMITS[0], min(LAYER_LIMITS[1], len(self.hidden) + change))
                 while len(self.hidden) < new_count:
                     self.hidden.append(DEFAULT_HIDDEN_WIDTH)
                 self.hidden = self.hidden[:new_count]
             elif key.startswith("hidden"):
                 index = int(key[6:])
-                self.hidden[index] = max(2, min(24, self.hidden[index] + change))
+                self.hidden[index] = max(WIDTH_LIMITS[0], min(WIDTH_LIMITS[1], self.hidden[index] + change))
             if (self.inputs != self.race.inputs or self.hidden != self.race.hidden
                     or self.car_count != self.race.population):
                 self._restart_training(resume=False)

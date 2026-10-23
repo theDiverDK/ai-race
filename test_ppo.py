@@ -86,7 +86,6 @@ class PPOTests(unittest.TestCase):
         race = PPORace(Track(1), 7, [8], 5, True, self.directory / "ppo_checkpoint.pt", resume=False)
         self.assertEqual(len(race.cars), main.PPO_WORKERS)
         self.assertIs(race.cars, race.worker_cars)
-        self.assertTrue(all(track is race.track for track in race.worker_tracks))
         self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars))
         self.assertTrue(all(car.progress == 0 for car in race.cars))
         start = race.track.points[0]
@@ -109,7 +108,7 @@ class PPOTests(unittest.TestCase):
             race.worker_cars[0].progress = race.track.length * 5
             race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=True)
         self.assertEqual(race.track.level, 2)
-        self.assertTrue(all(track is race.track for track in race.worker_tracks))
+        self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars))
         self.assertTrue(all(new is not old for new, old in zip(race.cars, previous_cars)))
         self.assertEqual(race.clean_runs_on_road, 0)
         self.assertEqual(race.best_ever, 0.0)
@@ -289,7 +288,7 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(race.clean_runs_on_road, 1)
         race.change_track(Track(len(main.ROAD_SPECS)))
         self.assertEqual(race.clean_runs_on_road, 0)
-        self.assertTrue(all(track is race.track for track in race.worker_tracks))
+        self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars))
         with patch.object(Car, "move", return_value=None):
             for _ in range(main.PPO_CLEAN_RUNS_PER_ROAD):
                 race.worker_cars[0].laps_completed = 5
@@ -297,7 +296,7 @@ class PPOTests(unittest.TestCase):
                 race._advance(list(range(main.PPO_WORKERS)), 0.0, collect=False)
         self.assertEqual(race.track.level, 1)
         self.assertEqual(race.clean_runs_on_road, 0)
-        self.assertTrue(all(track is race.track for track in race.worker_tracks))
+        self.assertTrue(all(race.track.on_road(car.x, car.y) for car in race.cars))
 
     def test_app_displays_road_advanced_by_ppo_cars(self):
         app = App()
@@ -312,7 +311,7 @@ class PPOTests(unittest.TestCase):
         self.assertEqual(app.road_level, 2)
         self.assertIs(app.track, app.race.track)
         self.assertIs(app.race.cars, app.race.worker_cars)
-        self.assertTrue(all(track is app.track for track in app.race.worker_tracks))
+        self.assertTrue(all(app.track.on_road(car.x, car.y) for car in app.race.cars))
 
     def test_algorithm_switch_preserves_both_in_memory_trainers(self):
         app = App()
@@ -333,7 +332,7 @@ class PPOTests(unittest.TestCase):
         app.handle_action("road:+")
         self.assertEqual(app.track.level, 2)
         self.assertIs(app.race.cars, app.race.worker_cars)
-        self.assertTrue(all(track is app.track for track in app.race.worker_tracks))
+        self.assertTrue(all(app.track.on_road(car.x, car.y) for car in app.race.cars))
 
     def test_algorithm_dropdown_switches_mode_in_event_loop(self):
         app = App()
