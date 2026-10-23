@@ -8,12 +8,16 @@ import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pygame
 from pygame._sdl2.video import Window
 
 from inspector import NetworkInspector
 from neural import Network, load_networks, next_generation, save_networks, slot_role
+
+if TYPE_CHECKING:
+    from driver_view import DriverView
 
 
 WORLD_W, HEIGHT, PANEL_W = 900, 800, 360
@@ -1092,6 +1096,7 @@ class App:
         self.algorithm_menu_open = False
         self.buttons: list[tuple[pygame.Rect, str]] = []
         self.inspector: NetworkInspector | None = None
+        self.driver_view: DriverView | None = None
         self.debug_notice: str | None = None
         self.debug_notice_until = 0
         if settings.get("algorithm") == "ppo":
@@ -1330,6 +1335,12 @@ class App:
                 self.inspector = NetworkInspector()
             else:
                 self.inspector.window.focus()
+        elif action == "cockpit":
+            if self.driver_view is None:
+                from driver_view import DriverView  # NumPy, like PPO, loads only when needed
+                self.driver_view = DriverView()
+            else:
+                self.driver_view.window.focus()
         else:
             key, sign = action.split(":")
             change = 1 if sign == "+" else -1
@@ -1509,7 +1520,8 @@ class App:
         self.label("OUTPUTS", x + 23, 711, MUTED, self.tiny)
         self.label("steer: L/R  •  drive: F/R  •  brake: slow/stop", x + 23, 727, TEXT, self.small)
         dirty = self.inputs != self.race.inputs or self.hidden != self.race.hidden
-        self.button(pygame.Rect(x + 22, 755, 153, 38), "VIEW NETWORK", "inspect")
+        self.button(pygame.Rect(x + 22, 755, 80, 38), "NETWORK", "inspect")
+        self.button(pygame.Rect(x + 106, 755, 69, 38), "COCKPIT", "cockpit")
         self.button(
             pygame.Rect(x + 184, 755, 154, 38),
             "APPLY & RESTART" if dirty else "RESTART TRAINING", "apply", primary=True,
@@ -1534,6 +1546,10 @@ class App:
                     if not self.inspector.handle_event(event):
                         self.inspector.close()
                         self.inspector = None
+                elif self.driver_view and window_id == self.driver_view.window.id:
+                    if not self.driver_view.handle_event(event):
+                        self.driver_view.close()
+                        self.driver_view = None
                 elif event.type == pygame.WINDOWCLOSE and window_id == self.main_window_id:
                     running = False
                 elif event.type == pygame.KEYDOWN:
@@ -1575,9 +1591,13 @@ class App:
             pygame.display.flip()
             if self.inspector:
                 self.inspector.draw(self.race, self.paused)
+            if self.driver_view:
+                self.driver_view.draw(self.race, self.paused)
             self.clock.tick(FPS)
         if self.inspector:
             self.inspector.close()
+        if self.driver_view:
+            self.driver_view.close()
         self.race.save_now()
         self._save_settings()
         pygame.quit()

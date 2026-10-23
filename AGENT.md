@@ -14,6 +14,7 @@ Neural Circuit: a Pygame race simulation with selectable neuroevolution and PPO 
 | `neural.py` | `Network` class, `next_generation()` (2 unchanged champions, 2 `minor_mutation` copies, bred children, random newcomers), and `save_networks()` / `load_networks()` for `best_network.json`. |
 | `ppo.py` | Actor-critic network, action sampling, generalized advantage estimates, clipped PPO minibatch updates, and `ppo_checkpoint.pt` persistence. |
 | `inspector.py` | `NetworkInspector`, the live network-visualisation window, and `activations()`. |
+| `driver_view.py` | `DriverView`, the **Cockpit** window: a NumPy perspective projection of `Track.art` from the leading car. `App` imports it lazily, so Evolution alone never loads NumPy. |
 | `test_race.py`, `test_neural.py`, `test_ppo.py` | `unittest` suites. |
 
 ## Commands

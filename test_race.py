@@ -219,6 +219,21 @@ class RaceTests(unittest.TestCase):
                 app.run()
         handle_action.assert_any_call("inspect")
 
+    def test_cockpit_window_shows_the_road_ahead_of_the_leader(self):
+        app = App()
+        app.handle_action("cockpit")
+        self.addCleanup(app.driver_view.close)
+        view = app.driver_view
+        track = app.race.track
+        (x, y), (nx, ny) = track.points[0], track.points[1]
+        pixels = view.road_pixels(track, x, y, math.atan2(ny - y, nx - x))
+        import driver_view
+        ahead, horizon = pixels[pixels.shape[0] // 2, -1], pixels[pixels.shape[0] // 2, 0]
+        self.assertGreater(max(abs(int(a) - b) for a, b in zip(ahead, driver_view.GROUND)), 20)
+        self.assertLess(max(abs(int(a) - b) for a, b in zip(horizon, driver_view.SKY_HORIZON)), 2)
+        view.draw(app.race, app.paused)
+        self.assertFalse(view.handle_event(pygame.event.Event(pygame.WINDOWCLOSE)))
+
     def test_network_controls_update_cars_and_open_inspector_immediately(self):
         app = App()
         app.paused = True

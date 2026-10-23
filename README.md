@@ -30,7 +30,8 @@ python main.py
 | **Debug** | Save `debug_snapshot.json` beside `best_network.json`. It records the current road, settings, and cars. It also keeps the last 20 generation changes for both algorithms, including the PPO cars' states and crash order immediately before each reset. Click it after a surprising reset; the file is ignored by Git and can be shared for diagnosis. |
 | `V` | Show or hide the leading car's sensor rays. |
 | `R` | Restart training with the current settings. |
-| **View Network** | Open a live window for the highest scoring evolutionary car or the current PPO policy. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its activation, bias, weighted input, and exact connection weights. PPO shows the policy's mean action; exploration can make the car's sampled action differ. |
+| **Network** | Open a live window for the highest scoring evolutionary car or the current PPO policy. The diagram shows every neuron and connection; green and orange lines indicate positive and negative weights. Click a neuron to see its activation, bias, weighted input, and exact connection weights. PPO shows the policy's mean action; exploration can make the car's sampled action differ. |
+| **Cockpit** | Open a live first-person window looking out of the leading car's windscreen (the green car, or the best car once all have stopped). The road ahead is drawn in perspective from the track itself, and the bonnet leans with the steering. |
 
 Car counts, sensor count, hidden-layer count and widths, runtime limit, limit toggle, simulation speed, and sensor visibility are saved automatically in `app_settings.json` beside `best_network.json`. They are restored on the next launch. A saved best model resumes only when its architecture matches the selected settings; otherwise training starts with the selected design while keeping the best score and model record. Missing or invalid settings fall back to the saved model's design or the defaults. Existing `settings.json` selections are migrated automatically. Evolution and PPO keep separate network designs.
 
@@ -70,7 +71,7 @@ A car is also removed when it gains less than 30 px of forward progress in 4 sec
 
 ### The network
 
-Each network is fully connected with `tanh` neurons. Its inputs are the sensor distances plus the car's own speed (signed, divided by top speed); the **Input neurons** control sets the number of sensors, and one speed input is always added. Without speed, a network cannot tell how hard to brake for a bend it is approaching. The inputs also feed the three outputs directly, next to the hidden layers, so simple reflexes such as steering toward the open side or braking when fast with a wall ahead need only a few weights. The **View Network** window draws these direct connections and lists them in the neuron details. Saved networks from before the speed input are ignored.
+Each network is fully connected with `tanh` neurons. Its inputs are the sensor distances plus the car's own speed (signed, divided by top speed); the **Input neurons** control sets the number of sensors, and one speed input is always added. Without speed, a network cannot tell how hard to brake for a bend it is approaching. The inputs also feed the three outputs directly, next to the hidden layers, so simple reflexes such as steering toward the open side or braking when fast with a wall ahead need only a few weights. The **Network** window draws these direct connections and lists them in the neuron details. Saved networks from before the speed input are ignored.
 
 ### Who won the last generation
 
